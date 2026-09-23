@@ -1,0 +1,532 @@
+diff --git a/tutorial/cpp/1-Flat.cpp b/tutorial/cpp/1-Flat.cpp
+index f274b60ab..dda03ce6d 100644
+--- a/tutorial/cpp/1-Flat.cpp
++++ b/tutorial/cpp/1-Flat.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <cstdio>
+ #include <cstdlib>
++#include <chrono>
+ #include <random>
+ 
+ #include <faiss/IndexFlat.h>
+@@ -14,10 +15,40 @@
+ // 64-bit int
+ using idx_t = faiss::idx_t;
+ 
+-int main() {
+-    int d = 64;      // dimension
+-    int nb = 100000; // database size
+-    int nq = 10000;  // nb of queries
++static int parse_positive_int_arg(
++        int argc,
++        char** argv,
++        int arg_idx,
++        int default_value,
++        const char* arg_name) {
++    if (argc <= arg_idx) {
++        return default_value;
++    }
++    char* end = nullptr;
++    long value = std::strtol(argv[arg_idx], &end, 10);
++    if (end == argv[arg_idx] || *end != '\0' || value <= 0) {
++        std::fprintf(stderr, "Invalid %s: %s\n", arg_name, argv[arg_idx]);
++        std::exit(1);
++    }
++    return static_cast<int>(value);
++}
++
++int main(int argc, char** argv) {
++    const auto program_start = std::chrono::steady_clock::now();
++
++    if (argc > 6) {
++        std::fprintf(
++                stderr,
++                "Usage: %s [d] [nb] [nq] [k] [batch_size]\n",
++                argv[0]);
++        return 1;
++    }
++
++    int d = parse_positive_int_arg(argc, argv, 1, 64, "d");
++    int nb = parse_positive_int_arg(argc, argv, 2, 17000000, "nb");
++    int nq = parse_positive_int_arg(argc, argv, 3, 100, "nq");
++    int k = parse_positive_int_arg(argc, argv, 4, 50, "k");
++    int batch_size = parse_positive_int_arg(argc, argv, 5, nq, "batch_size");
+ 
+     std::mt19937 rng;
+     std::uniform_real_distribution<> distrib;
+@@ -42,19 +73,25 @@ int main() {
+     faiss::IndexFlatL2 index(d); // call constructor
+     printf("is_trained = %s\n", index.is_trained ? "true" : "false");
+     index.add(nb, xb); // add vectors to the index
++    const auto add_done = std::chrono::steady_clock::now();
++    const auto elapsed_ms = std::chrono::duration<double, std::milli>(
++                                    add_done - program_start)
++                                    .count();
++    printf(
++            "[MARK] index.add() done, starting search, elapsed=%.3f ms\n",
++            elapsed_ms);
+     printf("ntotal = %zd\n", index.ntotal);
+ 
+-    int k = 4;
+-
+     { // sanity check: search 5 first vectors of xb
+-        idx_t* I = new idx_t[k * 5];
+-        float* D = new float[k * 5];
++        int sanity_nq = nb < 5 ? nb : 5;
++        idx_t* I = new idx_t[k * sanity_nq];
++        float* D = new float[k * sanity_nq];
+ 
+-        index.search(5, xb, k, D, I);
++        index.search(sanity_nq, xb, k, D, I);
+ 
+         // print results
+         printf("I=\n");
+-        for (int i = 0; i < 5; i++) {
++        for (int i = 0; i < sanity_nq; i++) {
+             for (int j = 0; j < k; j++) {
+                 printf("%5zd ", I[i * k + j]);
+             }
+@@ -62,7 +99,7 @@ int main() {
+         }
+ 
+         printf("D=\n");
+-        for (int i = 0; i < 5; i++) {
++        for (int i = 0; i < sanity_nq; i++) {
+             for (int j = 0; j < k; j++) {
+                 printf("%7g ", D[i * k + j]);
+             }
+@@ -73,15 +110,32 @@ int main() {
+         delete[] D;
+     }
+ 
++    // xb is no longer needed after add + xb sanity search.
++    delete[] xb;
++
+     { // search xq
+         idx_t* I = new idx_t[k * nq];
+         float* D = new float[k * nq];
+ 
+-        index.search(nq, xq, k, D, I);
++        for (int i0 = 0; i0 < nq; i0 += batch_size) {
++            int current_nq = nq - i0;
++            if (current_nq > batch_size) {
++                current_nq = batch_size;
++            }
++            size_t query_offset = static_cast<size_t>(i0) * d;
++            size_t result_offset = static_cast<size_t>(i0) * k;
++            index.search(
++                    current_nq,
++                    xq + query_offset,
++                    k,
++                    D + result_offset,
++                    I + result_offset);
++        }
+ 
+         // print results
+         printf("I (5 first results)=\n");
+-        for (int i = 0; i < 5; i++) {
++        int first_count = nq < 5 ? nq : 5;
++        for (int i = 0; i < first_count; i++) {
+             for (int j = 0; j < k; j++) {
+                 printf("%5zd ", I[i * k + j]);
+             }
+@@ -89,7 +143,8 @@ int main() {
+         }
+ 
+         printf("D (5 last results)=\n");
+-        for (int i = nq - 5; i < nq; i++) {
++        int start = nq > 5 ? nq - 5 : 0;
++        for (int i = start; i < nq; i++) {
+             for (int j = 0; j < k; j++) {
+                 printf("%5f ", D[i * k + j]);
+             }
+@@ -100,8 +155,13 @@ int main() {
+         delete[] D;
+     }
+ 
+-    delete[] xb;
+     delete[] xq;
+ 
++    const auto program_end = std::chrono::steady_clock::now();
++    const auto total_elapsed_ms = std::chrono::duration<double, std::milli>(
++                                          program_end - program_start)
++                                          .count();
++    printf("[MARK] program done, total elapsed=%.3f ms\n", total_elapsed_ms);
++
+     return 0;
+ }
+diff --git a/tutorial/cpp/CMakeLists.txt b/tutorial/cpp/CMakeLists.txt
+index 68a111844..4a71acdee 100644
+--- a/tutorial/cpp/CMakeLists.txt
++++ b/tutorial/cpp/CMakeLists.txt
+@@ -3,40 +3,45 @@
+ # This source code is licensed under the MIT license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++include(${CMAKE_SOURCE_DIR}/cmake/link_to_faiss_lib.cmake)
++
+ add_executable(1-Flat EXCLUDE_FROM_ALL 1-Flat.cpp)
+-target_link_libraries(1-Flat PRIVATE faiss)
++link_to_faiss_lib(1-Flat)
+ 
+ add_executable(2-IVFFlat EXCLUDE_FROM_ALL 2-IVFFlat.cpp)
+-target_link_libraries(2-IVFFlat PRIVATE faiss)
++link_to_faiss_lib(2-IVFFlat)
+ 
+ add_executable(3-IVFPQ EXCLUDE_FROM_ALL 3-IVFPQ.cpp)
+-target_link_libraries(3-IVFPQ PRIVATE faiss)
++link_to_faiss_lib(3-IVFPQ)
+ 
+ add_executable(4-GPU EXCLUDE_FROM_ALL 4-GPU.cpp)
+-target_link_libraries(4-GPU PRIVATE faiss)
++link_to_faiss_lib(4-GPU)
+ 
+ add_executable(5-Multiple-GPUs EXCLUDE_FROM_ALL 5-Multiple-GPUs.cpp)
+-target_link_libraries(5-Multiple-GPUs PRIVATE faiss)
++link_to_faiss_lib(5-Multiple-GPUs)
+ 
+ add_executable(6-HNSW EXCLUDE_FROM_ALL 6-HNSW.cpp)
+-target_link_libraries(6-HNSW PRIVATE faiss)
++link_to_faiss_lib(6-HNSW)
+ 
+ add_executable(7-PQFastScan EXCLUDE_FROM_ALL 7-PQFastScan.cpp)
+-target_link_libraries(7-PQFastScan PRIVATE faiss)
++link_to_faiss_lib(7-PQFastScan)
+ 
+ add_executable(8-PQFastScanRefine EXCLUDE_FROM_ALL 8-PQFastScanRefine.cpp)
+-target_link_libraries(8-PQFastScanRefine PRIVATE faiss)
++link_to_faiss_lib(8-PQFastScanRefine)
+ 
+ add_executable(9-RefineComparison EXCLUDE_FROM_ALL 9-RefineComparison.cpp)
+-target_link_libraries(9-RefineComparison PRIVATE faiss)
++link_to_faiss_lib(9-RefineComparison)
++
++add_executable(bench_search EXCLUDE_FROM_ALL bench_search.cpp)
++link_to_faiss_lib(bench_search)
+ 
+ if(FAISS_ENABLE_SVS)
+ 
+   add_executable(10-SVS-Vamana-LVQ EXCLUDE_FROM_ALL 10-SVS-Vamana-LVQ.cpp)
+-  target_link_libraries(10-SVS-Vamana-LVQ PRIVATE faiss)
++  link_to_faiss_lib(10-SVS-Vamana-LVQ)
+   target_compile_definitions(10-SVS-Vamana-LVQ PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
+ 
+   add_executable(11-SVS-Vamana-LeanVec EXCLUDE_FROM_ALL 11-SVS-Vamana-LeanVec.cpp)
+-  target_link_libraries(11-SVS-Vamana-LeanVec PRIVATE faiss)
++  link_to_faiss_lib(11-SVS-Vamana-LeanVec)
+   target_compile_definitions(11-SVS-Vamana-LeanVec PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
+ endif()
+diff --git a/tutorial/cpp/bench_search.cpp b/tutorial/cpp/bench_search.cpp
+new file mode 100644
+index 000000000..5fde56e74
+--- /dev/null
++++ b/tutorial/cpp/bench_search.cpp
+@@ -0,0 +1,307 @@
++/*
++ * Benchmark: load a pre-populated Faiss index, read queries from a
++ * .bvecs file, and run batched multi-threaded search.
++ *
++ * Usage:
++ *   bench_search --index <path> --queries <path.bvecs>
++ *                [--nthreads N] [--batch_size B] [--k K]
++ *                [--max_queries N]
++ *                [--stream_queries] [--params "nprobe=32,..."]
++ *
++ *   bench_search --index <path> --random_queries N
++ *                [--seed S] [--nthreads N] [--batch_size B] [--k K]
++ *                [--params "nprobe=32,..."]
++ */
++
++#include <algorithm>
++#include <cassert>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <random>
++#include <string>
++#include <vector>
++
++#include <sys/stat.h>
++
++#include <omp.h>
++
++#include <faiss/AutoTune.h>
++#include <faiss/Index.h>
++#include <faiss/index_io.h>
++
++// ---- I/O helpers ----------------------------------------------------------
++
++struct BvecsBatchReader {
++    explicit BvecsBatchReader(const char* fname) : f(fopen(fname, "rb")) {
++        if (!f) {
++            fprintf(stderr, "could not open %s\n", fname);
++            perror("");
++            abort();
++        }
++
++        int d_in;
++        size_t nr = fread(&d_in, sizeof(int), 1, f);
++        assert(nr == 1 && "failed to read dimension");
++        assert(d_in > 0 && d_in < 1000000 && "unreasonable dimension");
++
++        struct stat st;
++        int ret = fstat(fileno(f), &st);
++        assert(ret == 0 && "failed to stat bvecs file");
++
++        d = d_in;
++        vecsz = 4 + d; // 4-byte int header + d bytes of uint8
++        size_t sz = st.st_size;
++        assert(sz % vecsz == 0 && "weird file size for bvecs");
++        n = sz / vecsz;
++
++        reset();
++    }
++
++    ~BvecsBatchReader() {
++        if (f) {
++            fclose(f);
++        }
++    }
++
++    void reset() {
++        int ret = fseek(f, 0, SEEK_SET);
++        assert(ret == 0 && "failed to rewind bvecs file");
++    }
++
++    size_t read_batch(size_t batch_n, float* out) {
++        raw.resize(batch_n * vecsz);
++        size_t nr = fread(raw.data(), vecsz, batch_n, f);
++        for (size_t i = 0; i < nr; i++) {
++            const uint8_t* src = raw.data() + i * vecsz + 4;
++            for (size_t j = 0; j < d; j++) {
++                out[i * d + j] = static_cast<float>(src[j]);
++            }
++        }
++        return nr;
++    }
++
++    FILE* f = nullptr;
++    size_t d = 0;
++    size_t n = 0;
++    size_t vecsz = 0;
++    std::vector<uint8_t> raw;
++};
++
++// ---- CLI helpers ----------------------------------------------------------
++
++static const char* get_arg(int argc, char** argv, const char* name,
++                           const char* defval = nullptr) {
++    for (int i = 1; i < argc - 1; i++) {
++        if (strcmp(argv[i], name) == 0)
++            return argv[i + 1];
++    }
++    return defval;
++}
++
++static int get_int_arg(int argc, char** argv, const char* name, int defval) {
++    const char* v = get_arg(argc, argv, name);
++    return v ? atoi(v) : defval;
++}
++
++static bool has_flag(int argc, char** argv, const char* name) {
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], name) == 0)
++            return true;
++    }
++    return false;
++}
++
++// ---------------------------------------------------------------------------
++
++int main(int argc, char** argv) {
++    const char* index_path = get_arg(argc, argv, "--index");
++    const char* query_path = get_arg(argc, argv, "--queries");
++    int nthreads = get_int_arg(argc, argv, "--nthreads", 1);
++    int batch_size = get_int_arg(argc, argv, "--batch_size", 10000);
++    int k = get_int_arg(argc, argv, "--k", 100);
++    int max_queries = get_int_arg(argc, argv, "--max_queries", -1);
++    int random_queries = get_int_arg(argc, argv, "--random_queries", 0);
++    unsigned seed = (unsigned)get_int_arg(argc, argv, "--seed", 1234);
++    bool stream_queries = has_flag(argc, argv, "--stream_queries");
++    const char* params = get_arg(argc, argv, "--params", "");
++
++    if (!index_path || (!query_path && random_queries <= 0)) {
++        fprintf(stderr,
++                "Usage: %s --index <path> --queries <path.bvecs>\n"
++                "          [--nthreads N] [--batch_size B] [--k K]\n"
++                "          [--max_queries N]\n"
++                "          [--stream_queries]\n"
++                "          [--params \"nprobe=32,...\"]\n"
++                "   or  %s --index <path> --random_queries N [--seed S]\n"
++                "          [--nthreads N] [--batch_size B] [--k K]\n"
++                "          [--params \"nprobe=32,...\"]\n",
++                argv[0], argv[0]);
++        return 1;
++    }
++    if (query_path && random_queries > 0) {
++        fprintf(stderr,
++                "--queries and --random_queries are mutually exclusive\n");
++        return 1;
++    }
++    if (batch_size <= 0) {
++        fprintf(stderr, "--batch_size must be > 0\n");
++        return 1;
++    }
++    if (max_queries == 0 || max_queries < -1) {
++        fprintf(stderr, "--max_queries must be > 0 or -1 (no limit)\n");
++        return 1;
++    }
++    if (random_queries < 0) {
++        fprintf(stderr, "--random_queries must be > 0\n");
++        return 1;
++    }
++    bool use_random = random_queries > 0;
++    if (use_random && stream_queries) {
++        fprintf(stderr,
++                "--stream_queries is not supported with --random_queries\n");
++        return 1;
++    }
++
++    // --- set threads -------------------------------------------------------
++    omp_set_num_threads(nthreads);
++    printf(
++            "Using %d threads, batch_size=%d, k=%d, max_queries=%d, "
++            "stream_queries=%d\n",
++            nthreads,
++            batch_size,
++            k,
++            max_queries,
++            stream_queries);
++
++    // --- load index --------------------------------------------------------
++    printf("Loading index from %s ...\n", index_path);
++    auto t0 = std::chrono::steady_clock::now();
++    faiss::Index* index = faiss::read_index(index_path);
++    auto t1 = std::chrono::steady_clock::now();
++    double load_s =
++            std::chrono::duration<double>(t1 - t0).count();
++    printf("Index loaded in %.3f s  (d=%d, ntotal=%zd)\n",
++           load_s, (int)index->d, (ssize_t)index->ntotal);
++
++    // --- set search parameters ---------------------------------------------
++    if (params && params[0]) {
++        printf("Setting parameters: %s\n", params);
++        faiss::ParameterSpace ps;
++        ps.initialize(index);
++        ps.set_index_parameters(index, params);
++    }
++
++    // --- prepare queries ---------------------------------------------------
++    size_t d_q = 0;
++    size_t nq = 0;
++    std::unique_ptr<BvecsBatchReader> query_reader;
++    if (use_random) {
++        d_q = index->d;
++        nq = (size_t)random_queries;
++        printf("Generating %zd random queries (d=%zd, seed=%u)\n",
++               (ssize_t)nq, (ssize_t)d_q, seed);
++    } else {
++        printf("Inspecting queries from %s ...\n", query_path);
++        query_reader.reset(new BvecsBatchReader(query_path));
++        d_q = query_reader->d;
++        size_t total_nq = query_reader->n;
++        nq = total_nq;
++        assert((int)d_q == index->d && "query dimension mismatch");
++        if (max_queries > 0) {
++            nq = std::min<size_t>(nq, max_queries);
++        }
++        printf(
++                "Query file has %zd queries (d=%zd), using %zd\n",
++                (ssize_t)total_nq,
++                (ssize_t)d_q,
++                (ssize_t)nq);
++    }
++
++    // --- search in batches -------------------------------------------------
++    size_t batch_cap = std::min<size_t>(batch_size, nq);
++    float* xq = nullptr;
++    std::vector<float> xq_batch(batch_cap * d_q);
++    std::vector<faiss::idx_t> I(batch_cap * k);
++    std::vector<float> D(batch_cap * k);
++    int show = std::min((size_t)5, nq);
++    std::vector<float> sample_xq((size_t)show * d_q);
++
++    if (use_random) {
++        printf("Generating random queries into memory ...\n");
++        xq = new float[nq * d_q];
++        std::mt19937 rng(seed);
++        std::uniform_real_distribution<float> dist(0.0f, 255.0f);
++        size_t total = nq * d_q;
++        for (size_t i = 0; i < total; i++) {
++            xq[i] = dist(rng);
++        }
++    } else if (stream_queries) {
++        printf("Streaming query batches from disk\n");
++    } else {
++        printf("Loading all queries into memory ...\n");
++        xq = new float[nq * d_q];
++        size_t nr = query_reader->read_batch(nq, xq);
++        assert(nr == nq && "could not read whole query file");
++    }
++
++    printf("Searching ...\n");
++    auto ts0 = std::chrono::steady_clock::now();
++
++    for (size_t offset = 0; offset < nq; offset += batch_size) {
++        size_t bsz = std::min((size_t)batch_size, nq - offset);
++        const float* batch_xq = nullptr;
++        if (stream_queries) {
++            size_t nr = query_reader->read_batch(bsz, xq_batch.data());
++            assert(nr == bsz && "could not read query batch");
++            batch_xq = xq_batch.data();
++
++            if (offset < (size_t)show) {
++                size_t sample_n = std::min((size_t)show - offset, bsz);
++                memcpy(
++                        sample_xq.data() + offset * d_q,
++                        batch_xq,
++                        sample_n * d_q * sizeof(float));
++            }
++        } else {
++            batch_xq = xq + offset * d_q;
++        }
++
++        index->search(
++                bsz,
++                batch_xq,
++                k,
++                D.data(),
++                I.data());
++    }
++
++    auto ts1 = std::chrono::steady_clock::now();
++    double search_s =
++            std::chrono::duration<double>(ts1 - ts0).count();
++    double qps = search_s > 0 ? nq / search_s : 0.0;
++    double ms_per_q = nq > 0 ? search_s * 1000.0 / nq : 0.0;
++
++    printf("Search done: %.3f s total, %.1f QPS, %.3f ms/query\n",
++           search_s, qps, ms_per_q);
++
++    // --- print a few sample results ----------------------------------------
++    printf("\nFirst %d results (id : distance):\n", show);
++    const float* sample_queries = stream_queries ? sample_xq.data() : xq;
++    for (int i = 0; i < show; i++) {
++        index->search(1, sample_queries + (size_t)i * d_q, k, D.data(), I.data());
++        printf("  query %d:", i);
++        for (int j = 0; j < std::min(k, 5); j++) {
++            printf("  %zd:%.4f",
++                   (ssize_t)I[j],
++                   D[j]);
++        }
++        printf(" ...\n");
++    }
++
++    delete[] xq;
++    delete index;
++    return 0;
++}

@@ -1,0 +1,16 @@
+{
+  "vm_state_items": [
+    "nr_free_pages"
+  ],
+  "vm_acc_items": [
+    "numa_hint_faults",
+    "numa_hint_faults_local",
+    "pgpromote_success",
+    "pgpromote_candidate",
+    "pgdemote_kswapd",
+    "pgscan_kswapd",
+    "pgdemote_direct",
+    "pgmigrate_success",
+    "pgmigrate_fail"
+  ]
+}

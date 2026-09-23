@@ -1,0 +1,1659 @@
+diff --git a/linux/include/linux/htmm.h b/linux/include/linux/htmm.h
+index e3ab4b695..7d3858430 100644
+--- a/linux/include/linux/htmm.h
++++ b/linux/include/linux/htmm.h
+@@ -3,7 +3,8 @@
+ #define DEFERRED_SPLIT_ISOLATED 1
+ 
+ #define BUFFER_SIZE	32 /* 128: 1MB */
+-#define CPUS_PER_SOCKET 20
++// #define CPUS_PER_SOCKET 20
++#define CPUS_PER_SOCKET 28
+ #define MAX_MIGRATION_RATE_IN_MBPS  2048 /* 2048MB per sec */
+ 
+ 
+diff --git a/linux/include/linux/mempolicy.h b/linux/include/linux/mempolicy.h
+index cb7c85c59..ea75b0c58 100644
+--- a/linux/include/linux/mempolicy.h
++++ b/linux/include/linux/mempolicy.h
+@@ -205,6 +205,15 @@ extern bool htmm_cxl_mode;
+ extern bool htmm_skip_cooling;
+ extern unsigned int htmm_thres_cooling_alloc;
+ extern unsigned int ksampled_soft_cpu_quota;
++extern int htmm_cong_nid;
++extern unsigned long htmm_local_lat;
++extern unsigned long htmm_remote_lat;
++extern unsigned long htmm_local_rate;
++extern unsigned long htmm_remote_rate;
++extern unsigned int htmm_cong_demotion;
++extern unsigned int htmm_cong_delta;
++extern unsigned int htmm_cong_max_batch;
++extern unsigned int htmm_cong_epsilon;
+ #endif
+ static inline bool mpol_is_preferred_many(struct mempolicy *pol)
+ {
+diff --git a/linux/include/linux/node.h b/linux/include/linux/node.h
+index a70574770..0e3528084 100644
+--- a/linux/include/linux/node.h
++++ b/linux/include/linux/node.h
+@@ -183,7 +183,12 @@ static inline void register_hugetlbfs_with_node(node_registration_func_t reg,
+ 
+ static inline bool node_is_toptier(int node)
+ {
+-    return node_state(node, N_CPU);
++#if defined(CONFIG_MEMTIS_ALTERNATE_TIER_NUMA) && \
++	defined(CONFIG_MEMTIS_DEFAULT_TIER_NUMA)
++	return (node == CONFIG_MEMTIS_DEFAULT_TIER_NUMA) ? true : false;
++#else
++	return node_state(node, N_CPU);
++#endif
+ }
+ 
+ #endif /* _LINUX_NODE_H_ */
+diff --git a/linux/include/linux/vm_event_item.h b/linux/include/linux/vm_event_item.h
+index 944e13b63..741fd761f 100644
+--- a/linux/include/linux/vm_event_item.h
++++ b/linux/include/linux/vm_event_item.h
+@@ -116,6 +116,7 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ #ifdef CONFIG_HTMM
+ 		HTMM_NR_PROMOTED,
+ 		HTMM_NR_DEMOTED,
++		HTMM_NR_CONG_DEMOTED,
+ 		HTMM_NR_SAMPLED,
+ 		HTMM_MISSED_DRAMREAD,
+ 		HTMM_MISSED_NVMREAD,
+diff --git a/linux/mm/Kconfig b/linux/mm/Kconfig
+index 164fa7128..674246db9 100644
+--- a/linux/mm/Kconfig
++++ b/linux/mm/Kconfig
+@@ -259,6 +259,25 @@ config HUGETLB_PAGE_SIZE_VARIABLE
+ 	  HUGETLB_PAGE_ORDER when there are multiple HugeTLB page sizes available
+ 	  on a platform.
+ 
++menu "NUMA Configuration for Tiered Memory"
++
++config MEMTIS_DEFAULT_TIER_NUMA
++    int "Default NUMA tier for MEMTIS"
++    default 0
++    help
++      Specify the default NUMA tier for MEMTIS.
++      Must be an integer.
++
++config MEMTIS_ALTERNATE_TIER_NUMA
++    int "Alternate NUMA tier for MEMTIS"
++    default 1
++    help
++      Specify the alternate NUMA tier for MEMTIS.
++      Must be an integer.
++
++endmenu
++
++
+ config CONTIG_ALLOC
+ 	def_bool (MEMORY_ISOLATION && COMPACTION) || CMA
+ 
+diff --git a/linux/mm/htmm_core.c b/linux/mm/htmm_core.c
+index c4ecbc0e8..e9b730bfe 100644
+--- a/linux/mm/htmm_core.c
++++ b/linux/mm/htmm_core.c
+@@ -1364,13 +1364,13 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e)
+     
+     /* increase sample counts only for valid records */
+     ret = __update_pginfo(vma, address);
+-    if (ret == 1) { /* memory accesses to DRAM */
++    if (ret == 1) { /* memory accesses to DRAM (local) */
+ 	memcg->nr_sampled++;
+ 	memcg->nr_sampled_for_split++;
+ 	memcg->nr_dram_sampled++;
+ 	memcg->nr_max_sampled++;
+     }
+-    else if (ret == 2) {
++    else if (ret == 2) { /* memory accesses to slow tier */
+ 	memcg->nr_sampled++;
+ 	memcg->nr_sampled_for_split++;
+ 	memcg->nr_max_sampled++;
+diff --git a/linux/mm/htmm_migrater.c b/linux/mm/htmm_migrater.c
+index a37dae0b7..b6e320abe 100644
+--- a/linux/mm/htmm_migrater.c
++++ b/linux/mm/htmm_migrater.c
+@@ -98,6 +98,102 @@ unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages)
+ 	return max_nr_pages;
+ }
+ 
++/* colloid: is this node's local memory congested vs. the remote tier? */
++static bool htmm_node_congested(int nid)
++{
++    unsigned long l, r;
++
++    if (!htmm_cong_demotion)
++	return false;
++    if (nid != READ_ONCE(htmm_cong_nid))
++	return false;
++    l = READ_ONCE(htmm_local_lat);
++    r = READ_ONCE(htmm_remote_lat);
++    if (r == 0)
++	return false;
++    return l > r * (100 + htmm_cong_delta) / 100;
++}
++
++/* colloid: persistent binary-search watermarks for the access-probability
++ * shift (Algorithm 2 of Vuppalapati & Agarwal, "Tiered Memory Management:
++ * Access Latency is the Key!", SOSP'24). Single monitored node. */
++#define COLLOID_FP_SHIFT 10
++#define COLLOID_FP_ONE	 (1UL << COLLOID_FP_SHIFT)
++
++static unsigned long cong_p_lo;			/* low watermark  (fixed-point) */
++static unsigned long cong_p_hi = COLLOID_FP_ONE;/* high watermark (fixed-point) */
++
++/*
++ * colloid: COMPUTESHIFT (Algorithm 2) + page-count translation.
++ *
++ * Runs every demotion quantum (not only when congested) so that *both*
++ * watermarks keep tightening and the binary search brackets the equilibrium
++ * p*; calling it only in the congested branch would leave cong_p_lo pinned at
++ * 0, making dp = p/2 every period and oscillating instead of converging.
++ *
++ * Measures p = R_D/(R_D+R_A), updates the watermark on the side indicated by
++ * the latency ordering, and returns the desired shift |midpoint(p_lo,p_hi) - p|
++ * translated into a hot-page count (shed a dp/p fraction of the local active
++ * set). Returns >0 only in the demote regime (L_D > L_A); in the promote
++ * regime the promotion thread acts, here we just record cong_p_lo.
++ */
++static unsigned long colloid_compute_demote_pages(struct mem_cgroup *memcg,
++	pg_data_t *pgdat)
++{
++    unsigned long ld = READ_ONCE(htmm_local_lat);
++    unsigned long la = READ_ONCE(htmm_remote_lat);
++    unsigned long rd = READ_ONCE(htmm_local_rate);
++    unsigned long ra = READ_ONCE(htmm_remote_rate);
++    unsigned long delta = (unsigned long)htmm_cong_delta;
++    unsigned long eps = (unsigned long)htmm_cong_epsilon * COLLOID_FP_ONE / 100;
++    unsigned long p, mid, dp, gap, nr_active, nr;
++
++    if (ld == 0 || la == 0 || (rd + ra) == 0)
++	return 0;
++
++    /* p: local tier's current share of access probability */
++    p = (rd << COLLOID_FP_SHIFT) / (rd + ra);
++
++    /* Algo 2, line 2: balanced dead-band |L_D - L_A| < delta% * L_D */
++    gap = (ld > la) ? (ld - la) : (la - ld);
++    if (gap * 100 < delta * ld)
++	return 0;
++
++    /* Algo 2, line 4: tighten the watermark on the appropriate side */
++    if (ld < la)
++	cong_p_lo = p;
++    else
++	cong_p_hi = p;
++
++    /* Algo 2, lines 5-6: watermarks collapsed but not balanced -> reset */
++    if (cong_p_hi < cong_p_lo + eps) {
++	if (ld < la)
++	    cong_p_hi = COLLOID_FP_ONE;
++	else
++	    cong_p_lo = 0;
++    }
++
++    /* promote regime: nothing to demote, watermark already recorded above */
++    if (ld < la)
++	return 0;
++
++    /* desired shift toward the midpoint: dp = p - (p_lo + p_hi)/2 */
++    mid = (cong_p_lo + cong_p_hi) >> 1;
++    if (p <= mid)
++	return 0;
++    dp = p - mid;
++
++    /* translate dp into a count of local hot pages (shed dp/p of the set) */
++    nr_active = lruvec_lru_size(mem_cgroup_lruvec(memcg, pgdat),
++			    LRU_ACTIVE_ANON, MAX_NR_ZONES);
++    nr = (nr_active * dp) / p;
++
++    /* static migration rate limit M */
++    if (nr > htmm_cong_max_batch)
++	nr = htmm_cong_max_batch;
++    return nr;
++}
++
+ unsigned long get_nr_lru_pages_node(struct mem_cgroup *memcg, pg_data_t *pgdat)
+ {
+     struct lruvec *lruvec;
+@@ -209,7 +305,11 @@ static bool promotion_available(int target_nid, struct mem_cgroup *memcg,
+ 
+     if (target_nid == NUMA_NO_NODE)
+ 	return false;
+-    
++
++    /* colloid: do not promote into a congested node */
++    if (htmm_node_congested(target_nid))
++	return false;
++
+     pgdat = NODE_DATA(target_nid);
+ 
+     cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
+@@ -223,6 +323,9 @@ static bool promotion_available(int target_nid, struct mem_cgroup *memcg,
+ 	*nr_to_promote = node_free_pages(pgdat);
+ 	return true;
+     }
++    else if (max_nr_pages <= fasttier_max_watermark) {
++	return false;
++    }
+     else if (cur_nr_pages + nr_isolated < max_nr_pages - fasttier_max_watermark) {
+ 	*nr_to_promote = max_nr_pages - fasttier_max_watermark - cur_nr_pages - nr_isolated;
+ 	return true;
+@@ -329,13 +432,15 @@ static struct page *alloc_migrate_page(struct page *page, unsigned long node)
+     return newpage;
+ }
+ 
++enum migrate_kind { MIG_PROMOTE, MIG_DEMOTE, MIG_DEMOTE_CONG };
++
+ static unsigned long migrate_page_list(struct list_head *migrate_list,
+-	pg_data_t *pgdat, bool promotion)
++	pg_data_t *pgdat, enum migrate_kind kind)
+ {
+     int target_nid;
+     unsigned int nr_succeeded = 0;
+ 
+-    if (promotion)
++    if (kind == MIG_PROMOTE)
+ 	target_nid = htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
+     else
+ 	target_nid = htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
+@@ -349,8 +454,10 @@ static unsigned long migrate_page_list(struct list_head *migrate_list,
+     migrate_pages(migrate_list, alloc_migrate_page, NULL,
+ 	    target_nid, MIGRATE_ASYNC, MR_NUMA_MISPLACED, &nr_succeeded);
+ 
+-    if (promotion)
++    if (kind == MIG_PROMOTE)
+ 	count_vm_events(HTMM_NR_PROMOTED, nr_succeeded);
++    else if (kind == MIG_DEMOTE_CONG)
++	count_vm_events(HTMM_NR_CONG_DEMOTED, nr_succeeded);
+     else
+ 	count_vm_events(HTMM_NR_DEMOTED, nr_succeeded);
+ 
+@@ -412,7 +519,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 	list_add(&page->lru, &ret_pages);
+     }
+ 
+-    nr_reclaimed = migrate_page_list(&demote_pages, pgdat, false);
++    nr_reclaimed = migrate_page_list(&demote_pages, pgdat, MIG_DEMOTE);
+     if (!list_empty(&demote_pages))
+ 	list_splice(&demote_pages, page_list);
+ 
+@@ -455,7 +562,7 @@ static unsigned long promote_page_list(struct list_head *page_list,
+ 	list_add(&page->lru, &ret_pages);
+     }
+ 
+-    nr_promoted = migrate_page_list(&promote_pages, pgdat, true);
++    nr_promoted = migrate_page_list(&promote_pages, pgdat, MIG_PROMOTE);
+     if (!list_empty(&promote_pages))
+ 	list_splice(&promote_pages, page_list);
+ 
+@@ -659,6 +766,108 @@ static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
+     return nr_promoted;
+ }
+ 
++/* colloid: mirror of promote_page_list(), but demote PageActive (hot) pages */
++static unsigned long demote_hot_page_list(struct list_head *page_list,
++	pg_data_t *pgdat)
++{
++    LIST_HEAD(demote_pages);
++    LIST_HEAD(ret_pages);
++    unsigned long nr_demoted = 0;
++
++    cond_resched();
++
++    while (!list_empty(page_list)) {
++	struct page *page;
++
++	page = lru_to_page(page_list);
++	list_del(&page->lru);
++
++	if (!trylock_page(page))
++	    goto __keep;
++	if (!PageActive(page) && htmm_mode != HTMM_NO_MIG)
++	    goto __keep_locked;
++	if (unlikely(!page_evictable(page)))
++	    goto __keep_locked;
++	if (PageWriteback(page))
++	    goto __keep_locked;
++	if (PageTransHuge(page) && !thp_migration_supported())
++	    goto __keep_locked;
++
++	list_add(&page->lru, &demote_pages);
++	unlock_page(page);
++	continue;
++__keep_locked:
++	unlock_page(page);
++__keep:
++	list_add(&page->lru, &ret_pages);
++    }
++
++    nr_demoted = migrate_page_list(&demote_pages, pgdat, MIG_DEMOTE_CONG);
++    if (!list_empty(&demote_pages))
++	list_splice(&demote_pages, page_list);
++
++    list_splice(&ret_pages, page_list);
++    return nr_demoted;
++}
++
++/* colloid: mirror of promote_active_list(), demoting hot pages downward */
++static unsigned long demote_active_list_cong(unsigned long nr_to_scan,
++	struct lruvec *lruvec, enum lru_list lru)
++{
++    LIST_HEAD(page_list);
++    pg_data_t *pgdat = lruvec_pgdat(lruvec);
++    unsigned long nr_taken, nr_demoted;
++
++    lru_add_drain();
++
++    spin_lock_irq(&lruvec->lru_lock);
++    nr_taken = isolate_lru_pages(nr_to_scan, lruvec, lru, &page_list, 0);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON, nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    if (nr_taken == 0)
++	return 0;
++
++    nr_demoted = demote_hot_page_list(&page_list, pgdat);
++
++    spin_lock_irq(&lruvec->lru_lock);
++    move_pages_to_lru(lruvec, &page_list);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON, -nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    mem_cgroup_uncharge_list(&page_list);
++    free_unref_page_list(&page_list);
++
++    return nr_demoted;
++}
++
++/* colloid: demote up to nr_to_demote hot pages from the congested node */
++static unsigned long demote_node_congestion(pg_data_t *pgdat,
++	struct mem_cgroup *memcg, unsigned long nr_to_demote)
++{
++    struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
++    unsigned long nr_demoted = 0;
++    enum lru_list lru = LRU_ACTIVE_ANON;
++    short priority = DEF_PRIORITY;
++
++    nr_to_demote = min(nr_to_demote,
++		    lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
++    if (nr_to_demote == 0)
++	return 0;
++
++    do {
++	unsigned long nr = nr_to_demote >> priority;
++
++	if (nr)
++	    nr_demoted += demote_active_list_cong(nr, lruvec, lru);
++	if (nr_demoted >= nr_to_demote)
++	    break;
++	priority--;
++    } while (priority);
++
++    return nr_demoted;
++}
++
+ static unsigned long cooling_active_list(unsigned long nr_to_scan,
+ 	struct lruvec *lruvec, enum lru_list lru)
+ {
+@@ -989,6 +1198,17 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
+ 	if (need_toptier_demotion(pgdat, memcg, &nr_exceeded)) {
+ 	    demote_node(pgdat, memcg, nr_exceeded);
+ 	}
++
++	/* colloid: COMPUTESHIFT runs every quantum on the monitored node so the
++	 * watermarks keep bracketing p*; it returns >0 only when local memory is
++	 * the congested (higher-latency) tier, demoting the hottest pages then. */
++	if (READ_ONCE(htmm_cong_demotion) &&
++		pgdat->node_id == READ_ONCE(htmm_cong_nid)) {
++	    unsigned long nr_cong = colloid_compute_demote_pages(memcg, pgdat);
++
++	    if (nr_cong)
++		demote_node_congestion(pgdat, memcg, nr_cong);
++	}
+ 	//if (need_direct_demotion(pgdat, memcg))
+ 	  //  goto demotion;
+ 
+diff --git a/linux/mm/htmm_sampler.c b/linux/mm/htmm_sampler.c
+index 778b5a45f..3a23c0fb4 100644
+--- a/linux/mm/htmm_sampler.c
++++ b/linux/mm/htmm_sampler.c
+@@ -246,13 +246,14 @@ static int ksamplingd(void *data)
+ 		    /* perf_buffer is ring buffer */
+ 		    up = READ_ONCE(rb->user_page);
+ 		    head = READ_ONCE(up->data_head);
+-		    if (head == up->data_tail) {
++		    if (head == up->data_tail) { /* no samples in buffer */
+ 			if (cpu < 16)
+ 			    nr_skip++;
+ 			//continue;
+ 			break;
+ 		    }
+ 
++		    /* check if still have samples in rb */
+ 		    head -= up->data_tail;
+ 		    if (head > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
+ 			cond = true;
+@@ -314,8 +315,9 @@ static int ksamplingd(void *data)
+ 		    smp_mb();
+ 		    WRITE_ONCE(up->data_tail, up->data_tail + ph->size);
+ 		} while (cond);
+-	    }
+-	}
++	    } /* for each perf event */
++	} /* for each cpu on this socket */
++
+ 	/* if ksampled_soft_cpu_quota is zero, disable dynamic pebs feature */
+ 	if (!ksampled_soft_cpu_quota)
+ 	    continue;
+@@ -378,7 +380,7 @@ static int ksamplingd(void *data)
+ 	    trace_cputime = cur;
+ 	    trace_runtime = cur_runtime;
+ 	}
+-    }
++    } /* kthread should stop */
+ 
+     total_runtime = (t->se.sum_exec_runtime) - total_runtime; // ns
+     total_cputime = jiffies_to_usecs(jiffies - total_cputime); // us
+diff --git a/linux/mm/mempolicy.c b/linux/mm/mempolicy.c
+index 3630fe9b4..c62e45460 100644
+--- a/linux/mm/mempolicy.c
++++ b/linux/mm/mempolicy.c
+@@ -3047,6 +3047,24 @@ bool htmm_cxl_mode = false;
+ bool htmm_skip_cooling = true;
+ unsigned int htmm_thres_cooling_alloc = 256 * 1024 * 10; // unit: 4KiB, default: 10GB
+ unsigned int ksampled_soft_cpu_quota = 30; // 3 %
++
++/* colloid-style demotion-on-congestion: signals written by the colloid-mon sensor */
++int htmm_cong_nid = NUMA_NO_NODE;	/* fast/local node being monitored */
++EXPORT_SYMBOL(htmm_cong_nid);
++unsigned long htmm_local_lat = 0;	/* smoothed local loaded latency  */
++EXPORT_SYMBOL(htmm_local_lat);
++unsigned long htmm_remote_lat = 0;	/* smoothed remote loaded latency */
++EXPORT_SYMBOL(htmm_remote_lat);
++unsigned long htmm_local_rate = 0;	/* smoothed local arrival rate    (R_D) */
++EXPORT_SYMBOL(htmm_local_rate);
++unsigned long htmm_remote_rate = 0;	/* smoothed remote arrival rate   (R_A) */
++EXPORT_SYMBOL(htmm_remote_rate);
++
++/* kernel-owned policy knobs (tunable via /sys/kernel/mm/htmm/) */
++unsigned int htmm_cong_demotion = 0;	  /* master enable (0=off)                  */
++unsigned int htmm_cong_max_batch = 65536; /* migration rate limit M (pages/period)  */
++unsigned int htmm_cong_delta = 5;	  /* balanced dead-band: |L_D-L_A| < delta% */
++unsigned int htmm_cong_epsilon = 1;	  /* watermark-collapse reset threshold (%) */
+ #endif
+ 
+ #ifdef CONFIG_SYSFS
+@@ -3606,6 +3624,133 @@ static struct kobj_attribute htmm_thres_cooling_alloc_attr =
+ 
+ 
+ 
++static ssize_t htmm_cong_demotion_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_cong_demotion);
++}
++static ssize_t htmm_cong_demotion_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int v;
++
++	err = kstrtouint(buf, 10, &v);
++	if (err)
++		return err;
++	WRITE_ONCE(htmm_cong_demotion, v);
++	return count;
++}
++static struct kobj_attribute htmm_cong_demotion_attr =
++	__ATTR(htmm_cong_demotion, 0644, htmm_cong_demotion_show,
++	       htmm_cong_demotion_store);
++
++static ssize_t htmm_cong_delta_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_cong_delta);
++}
++static ssize_t htmm_cong_delta_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int v;
++
++	err = kstrtouint(buf, 10, &v);
++	if (err)
++		return err;
++	WRITE_ONCE(htmm_cong_delta, v);
++	return count;
++}
++static struct kobj_attribute htmm_cong_delta_attr =
++	__ATTR(htmm_cong_delta, 0644, htmm_cong_delta_show, htmm_cong_delta_store);
++
++static ssize_t htmm_cong_max_batch_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_cong_max_batch);
++}
++static ssize_t htmm_cong_max_batch_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int v;
++
++	err = kstrtouint(buf, 10, &v);
++	if (err)
++		return err;
++	WRITE_ONCE(htmm_cong_max_batch, v);
++	return count;
++}
++static struct kobj_attribute htmm_cong_max_batch_attr =
++	__ATTR(htmm_cong_max_batch, 0644, htmm_cong_max_batch_show,
++	       htmm_cong_max_batch_store);
++
++static ssize_t htmm_cong_epsilon_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_cong_epsilon);
++}
++static ssize_t htmm_cong_epsilon_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int v;
++
++	err = kstrtouint(buf, 10, &v);
++	if (err)
++		return err;
++	WRITE_ONCE(htmm_cong_epsilon, v);
++	return count;
++}
++static struct kobj_attribute htmm_cong_epsilon_attr =
++	__ATTR(htmm_cong_epsilon, 0644, htmm_cong_epsilon_show,
++	       htmm_cong_epsilon_store);
++
++static ssize_t htmm_local_lat_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", READ_ONCE(htmm_local_lat));
++}
++static struct kobj_attribute htmm_local_lat_attr =
++	__ATTR(htmm_local_lat, 0444, htmm_local_lat_show, NULL);
++
++static ssize_t htmm_remote_lat_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", READ_ONCE(htmm_remote_lat));
++}
++static struct kobj_attribute htmm_remote_lat_attr =
++	__ATTR(htmm_remote_lat, 0444, htmm_remote_lat_show, NULL);
++
++static ssize_t htmm_local_rate_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", READ_ONCE(htmm_local_rate));
++}
++static struct kobj_attribute htmm_local_rate_attr =
++	__ATTR(htmm_local_rate, 0444, htmm_local_rate_show, NULL);
++
++static ssize_t htmm_remote_rate_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", READ_ONCE(htmm_remote_rate));
++}
++static struct kobj_attribute htmm_remote_rate_attr =
++	__ATTR(htmm_remote_rate, 0444, htmm_remote_rate_show, NULL);
++
++static ssize_t htmm_cong_nid_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", READ_ONCE(htmm_cong_nid));
++}
++static struct kobj_attribute htmm_cong_nid_attr =
++	__ATTR(htmm_cong_nid, 0444, htmm_cong_nid_show, NULL);
++
+ static struct attribute *htmm_attrs[] = {
+ 	&htmm_sample_period_attr.attr,
+ 	&htmm_inst_sample_period_attr.attr,
+@@ -3626,6 +3771,15 @@ static struct attribute *htmm_attrs[] = {
+ 	&htmm_cxl_mode_attr.attr,
+ 	&htmm_skip_cooling_attr.attr,
+ 	&htmm_thres_cooling_alloc_attr.attr,
++	&htmm_cong_demotion_attr.attr,
++	&htmm_cong_delta_attr.attr,
++	&htmm_cong_max_batch_attr.attr,
++	&htmm_cong_epsilon_attr.attr,
++	&htmm_local_lat_attr.attr,
++	&htmm_remote_lat_attr.attr,
++	&htmm_local_rate_attr.attr,
++	&htmm_remote_rate_attr.attr,
++	&htmm_cong_nid_attr.attr,
+ 	NULL,
+ };
+ 
+diff --git a/linux/mm/migrate.c b/linux/mm/migrate.c
+index 11591b057..6b5be9538 100644
+--- a/linux/mm/migrate.c
++++ b/linux/mm/migrate.c
+@@ -3226,6 +3226,17 @@ static int establish_migrate_target(int node, nodemask_t *used)
+ {
+ 	int migration_target;
+ 
++#if defined(CONFIG_MEMTIS_ALTERNATE_TIER_NUMA) && \
++	defined(CONFIG_MEMTIS_DEFAULT_TIER_NUMA)
++
++	/**
++	 * MEMTIS: overwrite node_demotion.
++	 * Warning: just for 2 nodes (1 node per socket) machine.
++	 */
++	migration_target = (node == CONFIG_MEMTIS_DEFAULT_TIER_NUMA) ?
++				CONFIG_MEMTIS_ALTERNATE_TIER_NUMA : NUMA_NO_NODE;
++	node_demotion[node] = migration_target;
++#else
+ 	/*
+ 	 * Can not set a migration target on a
+ 	 * node with it already set.
+@@ -3244,6 +3255,7 @@ static int establish_migrate_target(int node, nodemask_t *used)
+ 	node_demotion[node] = migration_target;
+ 	node_promotion[migration_target] = node;
+ 
++#endif
+ 	return migration_target;
+ }
+ 
+diff --git a/linux/mm/vmstat.c b/linux/mm/vmstat.c
+index 0e5217738..e57e8da63 100644
+--- a/linux/mm/vmstat.c
++++ b/linux/mm/vmstat.c
+@@ -1364,6 +1364,7 @@ const char * const vmstat_text[] = {
+ #ifdef CONFIG_HTMM
+ 	"htmm_nr_promoted",
+ 	"htmm_nr_demoted",
++	"htmm_nr_cong_demoted",
+ 	"htmm_nr_sampled",
+ 	"htmm_missed_dramread",
+ 	"htmm_missed_nvmread",
+diff --git a/memtis-userspace/colloid-mon/.gitignore b/memtis-userspace/colloid-mon/.gitignore
+new file mode 100644
+index 000000000..d3860f19d
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/.gitignore
+@@ -0,0 +1,8 @@
++*.o
++*.ko
++*.mod
++*.mod.c
++.*.cmd
++modules.order
++Module.symvers
++.tmp_versions/
+diff --git a/memtis-userspace/colloid-mon/Makefile b/memtis-userspace/colloid-mon/Makefile
+new file mode 100644
+index 000000000..8d059cbf7
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/Makefile
+@@ -0,0 +1,98 @@
++obj-m   := colloid-mon.o
++KDIR    := /lib/modules/$(shell uname -r)/build
++KCONFIG_SCRIPTS := $(KDIR)/scripts/kconfig
++PWD := $(shell pwd)
++
++ifdef M
++include $(M)/config.mk
++else
++include $(PWD)/config.mk
++endif
++
++# Frontend
++colloid-mon-objs := frontend.o
++
++# Select backend based on parameter
++ifeq ($(BACKEND), icx-native)
++	colloid-mon-objs += backend/icx-native.o
++	ifneq ($(DEFAULT_TIER), local-dram)
++    ifneq ($(DEFAULT_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(DEFAULT_TIER).)
++    endif
++    endif
++	ifneq ($(ALTERNATE_TIER), local-dram)
++    ifneq ($(ALTERNATE_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(ALTERNATE_TIER).)
++    endif
++    endif
++else ifeq ($(BACKEND), clx-native)
++	colloid-mon-objs += backend/clx-native.o
++	ifneq ($(DEFAULT_TIER), local-dram)
++    ifneq ($(DEFAULT_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(DEFAULT_TIER).)
++    endif
++    endif
++	ifneq ($(ALTERNATE_TIER), local-dram)
++    ifneq ($(ALTERNATE_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(ALTERNATE_TIER).)
++    endif
++    endif
++else ifeq ($(BACKEND), hsw-native)
++	colloid-mon-objs += backend/hsw-native.o
++	ifneq ($(DEFAULT_TIER), local-dram)
++    ifneq ($(DEFAULT_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(DEFAULT_TIER).)
++    endif
++    endif
++	ifneq ($(ALTERNATE_TIER), local-dram)
++    ifneq ($(ALTERNATE_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(ALTERNATE_TIER).)
++    endif
++    endif
++else ifeq ($(BACKEND), spr-native)
++    colloid-mon-objs += backend/spr-native.o
++    ifneq ($(DEFAULT_TIER), local-dram)
++    ifneq ($(DEFAULT_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(DEFAULT_TIER).)
++    endif
++    endif
++    ifneq ($(ALTERNATE_TIER), local-dram)
++    ifneq ($(ALTERNATE_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(ALTERNATE_TIER).)
++    endif
++    endif
++else
++	$(error Invalid backend: $(BACKEND).)
++endif
++
++# Configure default tier
++ifeq ($(DEFAULT_TIER), local-dram)
++EXTRA_CFLAGS += -DCOLLOID_CONFIG_DEFAULT_TIER_LOCAL_DRAM
++else ifeq ($(DEFAULT_TIER), remote-dram)
++EXTRA_CFLAGS += -DCOLLOID_CONFIG_DEFAULT_TIER_REMOTE_DRAM
++else ifeq ($(DEFAULT_TIER), cxl)
++EXTRA_CFLAGS += -DCOLLOID_CONFIG_DEFAULT_TIER_CXL
++else
++$(error Invalide default tier: $(TIER).)
++endif
++
++# Configure alternate tier
++ifeq ($(ALTERNATE_TIER), local-dram)
++EXTRA_CFLAGS += -DCOLLOID_CONFIG_ALTERNATE_TIER_LOCAL_DRAM
++else ifeq ($(ALTERNATE_TIER), remote-dram)
++EXTRA_CFLAGS += -DCOLLOID_CONFIG_ALTERNATE_TIER_REMOTE_DRAM
++else ifeq ($(ALTERNATE_TIER), cxl)
++EXTRA_CFLAGS += -DCOLLOID_CONFIG_ALTERNATE_TIER_CXL
++else
++$(error Invalide alternate tier: $(TIER).)
++endif
++
++EXTRA_CFLAGS += -DCORE_MON=$(CORE_MON)
++EXTRA_CFLAGS += -DLOCAL_NUMA=$(DEFAULT_TIER_NUMA)
++
++all: 
++	$(MAKE) -C $(KDIR) M=${PWD} SUBDIRS=$(PWD) modules
++
++clean:
++	$(MAKE) -C $(KDIR) M=${PWD} SUBDIRS=$(PWD) clean
++# rm -f *.ko *.o *.mod *.mod.c modules.order Module.symvers test
+\ No newline at end of file
+diff --git a/memtis-userspace/colloid-mon/backend/backend_iface.h b/memtis-userspace/colloid-mon/backend/backend_iface.h
+new file mode 100644
+index 000000000..2c5efc470
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/backend/backend_iface.h
+@@ -0,0 +1,21 @@
++#ifndef COLLOID_BACKEND_IFACE_H
++#define COLLOID_BACKEND_IFACE_H
++/*
++Interface for Colloid latency measurement backends
++*/
++
++#include <linux/types.h>
++
++struct backend_config {
++    int core;
++};
++
++int backend_init(struct backend_config* config);
++
++int backend_destroy(void);
++
++u64 backend_read_occupancy(int tier);
++
++u64 backend_read_inserts(int tier);
++
++#endif // COLLOID_BACKEND_IFACE_H
+diff --git a/memtis-userspace/colloid-mon/backend/clx-native.c b/memtis-userspace/colloid-mon/backend/clx-native.c
+new file mode 100644
+index 000000000..afbac9365
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/backend/clx-native.c
+@@ -0,0 +1,104 @@
++#include "backend_iface.h"
++#include <linux/kernel.h>
++#include <asm/msr.h>
++
++// CHA counters are MSR-based.  
++//   The starting MSR address is 0x0E00 + 0x10*CHA
++//   	Offset 0 is Unit Control -- mostly un-needed
++//   	Offsets 1-4 are the Counter PerfEvtSel registers
++//   	Offset 5 is Filter0	-- selects state for LLC lookup event (and TID, if enabled by bit 19 of PerfEvtSel)
++//   	Offset 6 is Filter1 -- lots of filter bits, including opcode -- default if unused should be 0x03b, or 0x------33 if using opcode matching
++//   	Offset 7 is Unit Status
++//   	Offsets 8,9,A,B are the Counter count registers
++#define CHA_MSR_PMON_BASE 0x0E00L
++#define CHA_MSR_PMON_CTL_BASE 0x0E01L
++#define CHA_MSR_PMON_FILTER0_BASE 0x0E05L
++#define CHA_MSR_PMON_FILTER1_BASE 0x0E06L
++#define CHA_MSR_PMON_STATUS_BASE 0x0E07L
++#define CHA_MSR_PMON_CTR_BASE 0x0E08L
++
++#define NUM_CHA_BOXES 18
++#define NUM_CHA_COUNTERS 4
++
++static int core_mon;
++
++int backend_init(struct backend_config* config) {
++    int cha, ret;
++    u32 msr_num;
++    u64 msr_val;
++
++    if(!config) {
++        printk(KERN_ERR "clx-native: invalid backend_config passed\n");
++        return -1;
++    }
++
++    core_mon = config->core;
++
++    for(cha = 0; cha < NUM_CHA_BOXES; cha++) {
++        msr_num = CHA_MSR_PMON_FILTER0_BASE + (0x10 * cha); // Filter0
++        msr_val = 0x00000000; // default; no filtering
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr FILTER0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_FILTER1_BASE + (0x10 * cha); // Filter1
++        msr_val = (cha%2 == 0)?(0x10040432):(0x10040431); // Filter DRd+RFO of local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr FILTER1 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 0; // counter 0
++        msr_val = 0x403136; // TOR Occupancy
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 1; // counter 1
++        msr_val = 0x403135; // TOR Inserts
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 1 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 2; // counter 2
++        msr_val = 0x400000; // CLOCKTICKS
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 2 failed\n");
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++int backend_destroy() {
++    return 0;
++}
++
++u64 backend_read_occupancy(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 0; // Occupancy
++    msr_num = CHA_MSR_PMON_CTR_BASE + (0x10 * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
++u64 backend_read_inserts(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 1; // Inserts
++    msr_num = CHA_MSR_PMON_CTR_BASE + (0x10 * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
+\ No newline at end of file
+diff --git a/memtis-userspace/colloid-mon/backend/hsw-native.c b/memtis-userspace/colloid-mon/backend/hsw-native.c
+new file mode 100644
+index 000000000..7ebce6897
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/backend/hsw-native.c
+@@ -0,0 +1,103 @@
++#include "backend_iface.h"
++#include <linux/kernel.h>
++#include <asm/msr.h>
++
++// CHA counters are MSR-based.  
++//   The starting MSR address is 0x0E00 + 0x10*CHA
++//   	Offset 0 is Unit Control -- mostly un-needed
++//   	Offsets 1-4 are the Counter PerfEvtSel registers
++//   	Offset 5 is Filter0	-- selects state for LLC lookup event (and TID, if enabled by bit 19 of PerfEvtSel)
++//   	Offset 6 is Filter1 -- lots of filter bits, including opcode -- default if unused should be 0x03b, or 0x------33 if using opcode matching
++//   	Offset 7 is Unit Status
++//   	Offsets 8,9,A,B are the Counter count registers
++#define CHA_MSR_PMON_BASE 0x0E00L
++#define CHA_MSR_PMON_CTL_BASE 0x0E01L
++#define CHA_MSR_PMON_FILTER0_BASE 0x0E05L
++#define CHA_MSR_PMON_FILTER1_BASE 0x0E06L
++#define CHA_MSR_PMON_STATUS_BASE 0x0E07L
++#define CHA_MSR_PMON_CTR_BASE 0x0E08L
++#define CHA_OFFSET 0x10
++
++#define FILTER1_LOCAL_VAL ((0x182 << 20) + 1)
++#define FILTER1_REMOTE_VAL ((0x182 << 20) + 2)
++#define CTL_OCCUPANCY 0x404336
++#define CTL_INSERTS 0x404335
++
++#define NUM_CHA_BOXES 10
++#define NUM_CHA_COUNTERS 4
++
++static int core_mon;
++
++int backend_init(struct backend_config* config) {
++    int cha, ret;
++    u32 msr_num;
++    u64 msr_val;
++
++    if(!config) {
++        printk(KERN_ERR "hsw-native: invalid backend_config passed\n");
++        return -1;
++    }
++
++    core_mon = config->core;
++    pr_err("core mon %d\n", core_mon);
++
++    for(cha = 0; cha < NUM_CHA_BOXES; cha++) {
++        msr_num = CHA_MSR_PMON_FILTER0_BASE + (CHA_OFFSET * cha); // Filter0
++        msr_val = 0x00000000; // default; no filtering
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "hsw-native: wrmsr FILTER0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_FILTER1_BASE + (CHA_OFFSET * cha); // Filter1
++        msr_val = (cha%2==0) ? FILTER1_LOCAL_VAL : FILTER1_REMOTE_VAL;
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if (ret != 0) {
++            printk(KERN_ERR "hsw-native: wrmsr FILTER1 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (CHA_OFFSET * cha) + 0; //counter 0
++        msr_val = CTL_OCCUPANCY;
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if (ret != 0) {
++            printk(KERN_ERR "hsw-native: wrmsr COUNTER 0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (CHA_OFFSET * cha) + 1; // counter 1
++        msr_val = CTL_INSERTS;
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if (ret != 0) {
++            printk(KERN_ERR "hsw-native: wrmsr COUNTER 1 failed\n");
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++int backend_destroy() {
++    return 0;
++}
++
++u64 backend_read_occupancy(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 0; // Occupancy
++    msr_num = CHA_MSR_PMON_CTR_BASE + (CHA_OFFSET * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
++u64 backend_read_inserts(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 1; // Inserts
++    msr_num = CHA_MSR_PMON_CTR_BASE + (CHA_OFFSET * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
+diff --git a/memtis-userspace/colloid-mon/backend/icx-native.c b/memtis-userspace/colloid-mon/backend/icx-native.c
+new file mode 100644
+index 000000000..520ef6248
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/backend/icx-native.c
+@@ -0,0 +1,88 @@
++#include "backend_iface.h"
++#include <linux/kernel.h>
++#include <asm/msr.h>
++
++#define CHA_MSR_PMON_BASE 0x0E00L
++#define CHA_MSR_PMON_CTL_BASE 0x0E01L
++#define CHA_MSR_PMON_FILTER0_BASE 0x0E05L
++// #define CHA_MSR_PMON_FILTER1_BASE 0x0E06L // No FILERT1 on Icelake
++#define CHA_MSR_PMON_STATUS_BASE 0x0E07L
++#define CHA_MSR_PMON_CTR_BASE 0x0E08L
++
++#define NUM_CHA_BOXES 18 // There are 32 CHA boxes in icelake server. After the first 18 boxes, the couter offsets change.
++#define NUM_CHA_COUNTERS 4
++
++static int core_mon;
++
++int backend_init(struct backend_config* config) {
++    int cha, ret;
++    u32 msr_num;
++    u64 msr_val;
++
++    if(!config) {
++        printk(KERN_ERR "icx-native: invalid backend_config passed\n");
++        return -1;
++    }
++
++    core_mon = config->core;
++
++    for(cha = 0; cha < NUM_CHA_BOXES; cha++) {
++        msr_num = CHA_MSR_PMON_FILTER0_BASE + (0xE * cha); // Filter0
++        msr_val = 0x00000000; // default; no filtering
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "icx-native: wrmsr FILTER0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0xE * cha) + 0; // counter 0
++        msr_val = (cha%2==0)?(0x00c8168600400136):(0x00c8170600400136); // TOR Occupancy, DRd, Miss, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "icx-native: wrmsr COUNTER 0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0xE * cha) + 1; // counter 1
++        msr_val = (cha%2==0)?(0x00c8168600400135):(0x00c8170600400135); // TOR Inserts, DRd, Miss, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR " icx-native: wrmsr COUNTER 1 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0xE * cha) + 2; // counter 2
++        msr_val = 0x400000; // CLOCKTICKS
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "icx-native: wrmsr COUNTER 2 failed\n");
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++int backend_destroy() {
++    return 0;
++}
++
++u64 backend_read_occupancy(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 0; // Occupancy
++    msr_num = CHA_MSR_PMON_CTR_BASE + (0xE * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
++u64 backend_read_inserts(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 1; // Inserts
++    msr_num = CHA_MSR_PMON_CTR_BASE + (0xE * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
+\ No newline at end of file
+diff --git a/memtis-userspace/colloid-mon/backend/spr-native.c b/memtis-userspace/colloid-mon/backend/spr-native.c
+new file mode 100644
+index 000000000..817c325d7
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/backend/spr-native.c
+@@ -0,0 +1,92 @@
++#include "backend_iface.h"
++#include <linux/kernel.h>
++#include <asm/msr.h>
++
++#define CHA_BOX_STRIDE           0x10ULL
++#define CHA_MSR_PMON_BASE        0x2000ULL
++#define CHA_MSR_CTL0_BASE        0x2002ULL
++#define CHA_MSR_CTR0_BASE        0x2008ULL
++#define CHA_MSR_FILTER0_BASE     0x200EULL
++#define CHA_MSR_STATUS_BASE      0x2001ULL
++
++
++#define NUM_CHA_BOXES 28
++#define NUM_CHA_COUNTERS 4
++
++static int core_mon;
++
++int backend_init(struct backend_config* config) {
++    int cha, ret;
++    u32 msr_num;
++    u64 msr_val;
++
++    if (!config) {
++        printk(KERN_ERR "spr-native: invalid backend_config passed\n");
++        return -1;
++    }
++
++    core_mon = config->core;
++    pr_info("colloid: core mon %d\n", core_mon);
++
++    for (cha = 0; cha < NUM_CHA_BOXES; cha++) {
++        msr_num = CHA_MSR_FILTER0_BASE + (CHA_BOX_STRIDE * cha); // Filter0
++        msr_val = 0x00000000; // default; no filtering
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if (ret != 0) {
++            printk(KERN_ERR "spr-native: wrmsr FILTER0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_CTL0_BASE + (CHA_BOX_STRIDE * cha) + 0; // counter 0
++        msr_val = (cha%2==0)?(0x00c8168600000136):(0x00c8170600000136); // TOR Occupancy, DRd, Miss, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "spr-native: wrmsr COUNTER 0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_CTL0_BASE + (CHA_BOX_STRIDE * cha) + 1; // counter 1
++        msr_val = (cha%2==0)?(0x00c8168600000135):(0x00c8170600000135); // TOR Inserts, DRd, Miss, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR " spr-native: wrmsr COUNTER 1 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_CTL0_BASE + (CHA_BOX_STRIDE * cha) + 2; // counter 2
++        msr_val = 0x1; // CLOCKTICKS
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "spr-native: wrmsr COUNTER 2 failed\n");
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++int backend_destroy() {
++    return 0;
++}
++
++
++u64 backend_read_occupancy(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 0; // Occupancy
++    msr_num = CHA_MSR_CTR0_BASE + (CHA_BOX_STRIDE * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
++u64 backend_read_inserts(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 1; // Inserts
++    msr_num = CHA_MSR_CTR0_BASE + (CHA_BOX_STRIDE * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
+diff --git a/memtis-userspace/colloid-mon/config.mk b/memtis-userspace/colloid-mon/config.mk
+new file mode 100644
+index 000000000..2f27d2e46
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/config.mk
+@@ -0,0 +1,24 @@
++# Default parameters
++# Note: do not add whitespace after parameter values
++
++# Latency measurement backend
++# Currently supported values
++# 	icx-native: Intel Icelake (native)
++# 	clx-native: Intel Cascadelake (native)
++# 	hsw-native: Intel Haswell (native)
++#   spr-native: Intel Sapphire Rapids (native)
++BACKEND ?= spr-native
++
++# Default/alternate tier types
++# Currently supported tier types
++#	local-dram: DRAM locally attached to default tier socket
++#	remote-dram: DRAM attached to remote socket
++DEFAULT_TIER ?= local-dram
++ALTERNATE_TIER ?= remote-dram
++
++# NUMA node for default tier
++DEFAULT_TIER_NUMA ?= 0
++
++# Core on which to run latency measurement
++# Should be a dedicated core on the default tier socket
++CORE_MON ?= 27
+diff --git a/memtis-userspace/colloid-mon/frontend.c b/memtis-userspace/colloid-mon/frontend.c
+new file mode 100644
+index 000000000..b0a747860
+--- /dev/null
++++ b/memtis-userspace/colloid-mon/frontend.c
+@@ -0,0 +1,273 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/debugfs.h>
++#include <linux/slab.h>
++#include <linux/version.h>
++#include <linux/mm.h>
++//#include <linux/memory-tiers.h>
++#include <linux/delay.h>
++#include "backend/backend_iface.h"
++
++// #define SPINPOLL // TODO: configure this
++#define SAMPLE_INTERVAL_MS 10 // Only used if SPINPOLL is not set
++#ifdef SPINPOLL
++#define EWMA_EXP 5
++#else
++#define EWMA_EXP 1
++#endif
++#define PRECISION 10 // bits
++
++extern int htmm_cong_nid;
++extern unsigned long htmm_local_lat;
++extern unsigned long htmm_remote_lat;
++extern unsigned long htmm_local_rate;
++extern unsigned long htmm_remote_rate;
++
++// #define CORE_MON 63
++// #define LOCAL_NUMA 1
++#define WORKER_BUDGET 1000000
++#define LOG_SIZE 10000
++#define MIN_LOCAL_LAT 100
++#define MIN_REMOTE_LAT 300
++
++#define NUM_TIERS 2
++#define NUM_COUNTERS 2
++
++u64 smoothed_occ_local, smoothed_inserts_local;
++u64 smoothed_occ_remote, smoothed_inserts_remote;
++u64 smoothed_lat_local, smoothed_lat_remote;
++
++void thread_fun_poll_cha(struct work_struct *);
++struct workqueue_struct *poll_cha_queue;
++#ifdef SPINPOLL
++struct work_struct poll_cha;
++#else
++DECLARE_DELAYED_WORK(poll_cha, thread_fun_poll_cha);
++#endif
++
++u64 cur_ctr_tsc[NUM_TIERS][NUM_COUNTERS], prev_ctr_tsc[NUM_TIERS][NUM_COUNTERS];
++u64 cur_ctr_val[NUM_TIERS][NUM_COUNTERS], prev_ctr_val[NUM_TIERS][NUM_COUNTERS];
++int terminate_mon;
++
++struct log_entry {
++    u64 tsc;
++    u64 occ_local;
++    u64 inserts_local;
++    u64 occ_remote;
++    u64 inserts_remote;
++};
++
++struct log_entry log_buffer[LOG_SIZE];
++int log_idx;
++
++static inline __attribute__((always_inline)) unsigned long rdtscp(void)
++{
++   unsigned long a, d, c;
++
++   __asm__ volatile("rdtscp" : "=a" (a), "=d" (d), "=c" (c));
++
++   return (a | (d << 32));
++}
++
++static void poll_cha_init(void) {
++    int ret;
++    struct backend_config config;
++
++    config.core = CORE_MON;
++
++    ret = backend_init(&config);
++    
++    if(ret != 0) {
++        printk(KERN_ERR "backend init failed\n");
++        return;
++    }
++}
++
++static inline void sample_cha_ctr(int cha, int ctr) {
++    // cha: tier; ctr = 0 => occupancy, ctr = 1 => inserts
++    u64 val;
++    if(ctr == 0) {
++        val = backend_read_occupancy(cha);
++    } else {
++        val = backend_read_inserts(cha);
++    }
++    prev_ctr_val[cha][ctr] = cur_ctr_val[cha][ctr];
++    cur_ctr_val[cha][ctr] = val;
++    prev_ctr_tsc[cha][ctr] = cur_ctr_tsc[cha][ctr];
++    cur_ctr_tsc[cha][ctr] = rdtscp();
++}
++
++// static void dump_log(void) {
++//     int i;
++//     pr_info("Dumping colloid mon log");
++//     for(i = 0; i < LOG_SIZE; i++) {
++//         printk("%llu %llu %llu %llu %llu\n", log_buffer[i].tsc, log_buffer[i].occ_local, log_buffer[i].inserts_local, log_buffer[i].occ_remote, log_buffer[i].inserts_remote);
++//     }
++// }
++
++void thread_fun_poll_cha(struct work_struct *work) {
++    int cpu = CORE_MON;
++    #ifdef SPINPOLL
++    u32 budget = WORKER_BUDGET;
++    #else
++    u32 budget = 1;
++    #endif
++    u64 cum_occ, delta_tsc, cur_occ, cur_inserts;
++    u64 cur_lat_local, cur_lat_remote;
++    
++    while (budget) {
++        // read counters and update state
++        sample_cha_ctr(0, 0); // default tier occupancy
++        sample_cha_ctr(0, 1); // default tier inserts
++        sample_cha_ctr(1, 0);
++        sample_cha_ctr(1, 1);
++
++        cum_occ = cur_ctr_val[0][0] - prev_ctr_val[0][0];
++        delta_tsc = cur_ctr_tsc[0][0] - prev_ctr_tsc[0][0];
++        cur_occ = (cum_occ << PRECISION);
++        cur_inserts = ((cur_ctr_val[0][1] - prev_ctr_val[0][1])<<PRECISION);
++        WRITE_ONCE(smoothed_occ_local, (cur_occ + ((1<<EWMA_EXP) - 1)*smoothed_occ_local)>>EWMA_EXP);
++        WRITE_ONCE(smoothed_inserts_local, (cur_inserts + ((1<<EWMA_EXP) - 1)*smoothed_inserts_local)>>EWMA_EXP);
++        cur_lat_local = (smoothed_inserts_local > 0)?(smoothed_occ_local/smoothed_inserts_local):(MIN_LOCAL_LAT);
++        cur_lat_local = (cur_lat_local > MIN_LOCAL_LAT)?(cur_lat_local):(MIN_LOCAL_LAT);
++        WRITE_ONCE(smoothed_lat_local, cur_lat_local);
++
++        cum_occ = cur_ctr_val[1][0] - prev_ctr_val[1][0];
++        delta_tsc = cur_ctr_tsc[1][0] - prev_ctr_tsc[1][0];
++        cur_occ = (cum_occ << PRECISION);
++        cur_inserts = ((cur_ctr_val[1][1] - prev_ctr_val[1][1])<<PRECISION);
++        WRITE_ONCE(smoothed_occ_remote, (cur_occ + ((1<<EWMA_EXP) - 1)*smoothed_occ_remote)>>EWMA_EXP);
++        WRITE_ONCE(smoothed_inserts_remote, (cur_inserts + ((1<<EWMA_EXP) - 1)*smoothed_inserts_remote)>>EWMA_EXP);
++        cur_lat_remote = (smoothed_inserts_remote > 0)?(smoothed_occ_remote/smoothed_inserts_remote):(MIN_REMOTE_LAT);
++        WRITE_ONCE(smoothed_lat_remote, (cur_lat_remote > MIN_REMOTE_LAT)?(cur_lat_remote):(MIN_REMOTE_LAT));
++
++        WRITE_ONCE(htmm_local_lat, smoothed_lat_local);
++        WRITE_ONCE(htmm_remote_lat, smoothed_lat_remote);
++        WRITE_ONCE(htmm_local_rate, smoothed_inserts_local);
++        WRITE_ONCE(htmm_remote_rate, smoothed_inserts_remote);
++
++        budget--;
++    }
++    if(!READ_ONCE(terminate_mon)){
++        #ifdef SPINPOLL
++        queue_work_on(cpu, poll_cha_queue, &poll_cha);
++        #else
++        queue_delayed_work_on(cpu, poll_cha_queue, &poll_cha, msecs_to_jiffies(SAMPLE_INTERVAL_MS));
++        #endif
++    }
++    else{
++        return;
++    }
++}
++
++static void init_mon_state(void) {
++    int cha, ctr;
++    for(cha = 0; cha < NUM_TIERS; cha++) {
++        for(ctr = 0; ctr < NUM_COUNTERS; ctr++) {
++            cur_ctr_tsc[cha][ctr] = 0;
++            cur_ctr_val[cha][ctr] = 0;
++            sample_cha_ctr(cha, ctr);
++        }
++    }
++    log_idx = 0;
++}
++
++static ssize_t colloid_latencies_show(struct kobject *kobj,
++        struct kobj_attribute *attr, char *buf)
++{
++    return sprintf(buf, "local %llu remote %llu\n",
++        smoothed_lat_local, smoothed_lat_remote);
++}
++static struct kobj_attribute colloid_latency_attr =
++__ATTR(latency, 0444, colloid_latencies_show, NULL);
++
++static struct attribute *colloid_attr[] = {
++    &colloid_latency_attr.attr,
++};
++
++static const struct attribute_group colloid_attr_group = {
++    .attrs = colloid_attr,
++};
++
++struct kobject *colloid_kobj = NULL;
++
++static int colloidmon_init(void)
++{
++    int i;
++    int err;
++
++    poll_cha_queue = alloc_workqueue("poll_cha_queue",  WQ_HIGHPRI | WQ_CPU_INTENSIVE, 0);
++    if (!poll_cha_queue) {
++        printk(KERN_ERR "Failed to create CHA workqueue\n");
++        return -ENOMEM;
++    }
++
++    #ifdef SPINPOLL
++    INIT_WORK(&poll_cha, thread_fun_poll_cha);
++    #else
++    INIT_DELAYED_WORK(&poll_cha, thread_fun_poll_cha);
++    #endif
++    poll_cha_init();
++    pr_info("Programmed counters");
++    // Initialize state
++    init_mon_state();
++    WRITE_ONCE(terminate_mon, 0);
++    #ifdef SPINPOLL
++    queue_work_on(CORE_MON, poll_cha_queue, &poll_cha);
++    #else
++    queue_delayed_work_on(CORE_MON, poll_cha_queue, &poll_cha, msecs_to_jiffies(SAMPLE_INTERVAL_MS));
++    #endif
++
++    WRITE_ONCE(htmm_cong_nid, LOCAL_NUMA);
++
++    colloid_kobj = kobject_create_and_add("colloid", kernel_kobj);
++    if (unlikely(!colloid_kobj)) {
++        printk(KERN_ERR "Failed to create colloid kobj\n");
++        return -ENOMEM;
++    }
++
++    err = sysfs_create_group(colloid_kobj, &colloid_attr_group);
++    if (err) {
++        printk(KERN_ERR "Failed to register colloid group\n");
++        kobject_put(colloid_kobj);
++        return err;
++    }
++
++    for(i = 0; i < 5; i++) {
++        msleep(1000);
++        printk("%llu %llu\n", READ_ONCE(smoothed_occ_local), READ_ONCE(smoothed_occ_remote));
++    }
++    
++    return 0;
++}
++ 
++static void colloidmon_exit(void)
++{
++    /* stop the kernel acting on stale data */
++    WRITE_ONCE(htmm_cong_nid, NUMA_NO_NODE);
++    WRITE_ONCE(htmm_local_lat, 0);
++    WRITE_ONCE(htmm_remote_lat, 0);
++    WRITE_ONCE(htmm_local_rate, 0);
++    WRITE_ONCE(htmm_remote_rate, 0);
++
++    WRITE_ONCE(terminate_mon, 1);
++    msleep(5000);
++    flush_workqueue(poll_cha_queue);
++    destroy_workqueue(poll_cha_queue);
++
++    if (colloid_kobj) {
++        sysfs_remove_group(colloid_kobj, &colloid_attr_group);
++        kobject_put(colloid_kobj);
++    }
++
++    // dump_log();
++
++    pr_info("colloidmon exit");
++}
++ 
++module_init(colloidmon_init);
++module_exit(colloidmon_exit);
++MODULE_AUTHOR("Midhul");
++MODULE_LICENSE("GPL");
+diff --git a/memtis-userspace/scripts/load_colloid_mon.sh b/memtis-userspace/scripts/load_colloid_mon.sh
+new file mode 100755
+index 000000000..b9b41e6af
+--- /dev/null
++++ b/memtis-userspace/scripts/load_colloid_mon.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++# Load the colloid-mon latency sensor and enable HTMM demotion-on-congestion.
++#
++# PREREQUISITES:
++#   * Running the Memtis kernel built with the htmm_cong_* changes (so
++#     htmm_cong_nid/htmm_local_lat/htmm_remote_lat/htmm_local_rate/htmm_remote_rate
++#     are exported).
++#   * The monitor core (CORE_MON in colloid-mon/config.mk, default 27) must be
++#     DEDICATED: keep the workload cpuset off it, e.g. set the htmm cgroup
++#     cpuset.cpus to 0-26 instead of 0-27.
++#
++# Usage: load_colloid_mon.sh [load|unload]   (default: load)
++set -e
++
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++MON_DIR="$SCRIPT_DIR/../colloid-mon"
++HTMM_SYS=/sys/kernel/mm/htmm
++
++if [ "${1:-load}" = "unload" ]; then
++    echo 0 | sudo tee "$HTMM_SYS/htmm_cong_demotion" >/dev/null 2>&1 || true
++    sudo rmmod colloid_mon 2>/dev/null || true
++    echo "colloid-mon unloaded; congestion demotion disabled"
++    exit 0
++fi
++
++make -C "$MON_DIR"
++sudo insmod "$MON_DIR/colloid-mon.ko"
++echo 1 | sudo tee "$HTMM_SYS/htmm_cong_demotion" >/dev/null
++
++echo "colloid-mon loaded; htmm_cong_nid=$(cat "$HTMM_SYS/htmm_cong_nid")"
++echo "latency: local=$(cat "$HTMM_SYS/htmm_local_lat") remote=$(cat "$HTMM_SYS/htmm_remote_lat")"
++echo "tunables: demotion=$(cat "$HTMM_SYS/htmm_cong_demotion") max_batch=$(cat "$HTMM_SYS/htmm_cong_max_batch") delta=$(cat "$HTMM_SYS/htmm_cong_delta") epsilon=$(cat "$HTMM_SYS/htmm_cong_epsilon")"
+diff --git a/memtis-userspace/scripts/set_htmm_memcg.sh b/memtis-userspace/scripts/set_htmm_memcg.sh
+index 0fa83eeda..ecb1afd29 100755
+--- a/memtis-userspace/scripts/set_htmm_memcg.sh
++++ b/memtis-userspace/scripts/set_htmm_memcg.sh
+@@ -2,28 +2,24 @@
+ 
+ CGROUP_NAME=$1
+ CGROUP_DIR=/sys/fs/cgroup
+-BASH_PID=$2
+ 
+ if [ "x$2" == "xremove" ]; then
+-	sudo rmdir ${CGROUP_DIR}/${CGROUP_NAME}
+-        exit
++	sudo cgdelete -g memory,cpuset:htmm
++    exit
+ fi
+ 
+ if [ ! -d "${CGROUP_DIR}/${CGROUP_NAME}" ]; then
+-	sudo mkdir -p ${CGROUP_DIR}/${CGROUP_NAME}
++	sudo cgcreate -g memory,cpuset:htmm
+ fi
+ 
+-echo "+memory" | sudo tee ${CGROUP_DIR}/cgroup.subtree_control
+-echo "+cpuset" | sudo tee ${CGROUP_DIR}/cgroup.subtree_control
+-
+-echo ${BASH_PID} | sudo tee ${CGROUP_DIR}/${CGROUP_NAME}/cgroup.procs
+-if [ "x$3" == "xenable" ]; then
++if [ "x$2" == "xenable" ]; then
++    echo 0-27 > ${CGROUP_DIR}/${CGROUP_NAME}/cpuset.cpus
+     echo "enabled" | sudo tee ${CGROUP_DIR}/${CGROUP_NAME}/memory.htmm_enabled
+     exit
+-elif [ "x$3" == "xdisable" ]; then
++elif [ "x$2" == "xdisable" ]; then
+     echo "disabled" | sudo tee ${CGROUP_DIR}/${CGROUP_NAME}/memory.htmm_enabled
+     exit
+ fi
+ 
+ echo "'set_htmm_memcg.sh' Invalid parameters...."
+-echo "./set_htmm_memcg.sh [cgroup name] [bash pid] [\"enable\" or \"disable\"]"
++echo "./set_htmm_memcg.sh [cgroup name] [\"enable\" or \"disable\"]"
+diff --git a/memtis-userspace/scripts/set_mem_size.sh b/memtis-userspace/scripts/set_mem_size.sh
+index 246ad038f..57a77fc47 100755
+--- a/memtis-userspace/scripts/set_mem_size.sh
++++ b/memtis-userspace/scripts/set_mem_size.sh
+@@ -6,9 +6,11 @@ NODE_ID=$2
+ NODE_SIZE=$3
+ MAX=18446744073709551615
+ 
++echo "set_mem_size.sh: node ${NODE_ID}, size ${NODE_SIZE} MiB"
++
+ if [ $# -ne 3 ]; then
+     echo "Not enough parameters..."
+-    echo "./set_mem_size.sh [cgroup name] [node id] [node size in (MB or GB) or \"max\"]"
++    echo "./set_mem_size.sh [cgroup name] [node id] [node size in MB \"max\"]"
+     exit
+ fi
+ 
+@@ -25,13 +27,7 @@ fi
+ if [ "x${NODE_SIZE}" == "xmax" ]; then
+     MEM_IN_BYTES=$MAX
+ else
+-    NODE_SIZE=${NODE_SIZE^^}
+-
+-    if [[ ${NODE_SIZE} =~ "MB" ]]; then
+-	MEM_IN_BYTES=`echo ${NODE_SIZE::-2}*1024*1024 | bc`
+-    elif [[ ${NODE_SIZE} =~ "GB" ]]; then
+-	MEM_IN_BYTES=`echo ${NODE_SIZE::-2}*1024*1024*1024 | bc`
+-    fi
++    MEM_IN_BYTES=$((NODE_SIZE * 1024 * 1024))
+ fi
+ 
+ echo ${MEM_IN_BYTES} | sudo tee ${CGROUP_DIR}/${CGROUP_NAME}/memory.max_at_node${NODE_ID}

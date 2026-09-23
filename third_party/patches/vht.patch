@@ -1,0 +1,369 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0e298b7..c107537 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -170,7 +170,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU
+         # Unfortunately, the external libraries (especially Folly) have too many warnings that we cannot silence
+         # Hence, we only do Werror if we are not building these
+         # Furthermore, mac has some more annoying errors in external libs
+-        add_compile_options(-Werror -Wno-interference-size)
++        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-interference-size>)
+     endif()
+ 
+     # Figure out relase flags
+@@ -363,6 +363,9 @@ add_executable(hashmap-hugepage-benchmark benchmark/app/hugepage-bench.cpp)
+ target_link_libraries(hashmap-hugepage-benchmark PRIVATE hashmap)
+ file(COPY benchmark/app/run_hugepage_bench.sh
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
++
++add_executable(qp-llc-bench benchmark/app/qp_llc_bench.cpp)
++target_link_libraries(qp-llc-bench PRIVATE hashmap)
+      
+ add_subdirectory(benchmark/)
+ 
+diff --git a/benchmark/app/read_bm_app.cpp b/benchmark/app/read_bm_app.cpp
+index 26e1cb7..cd24280 100644
+--- a/benchmark/app/read_bm_app.cpp
++++ b/benchmark/app/read_bm_app.cpp
+@@ -5,6 +5,12 @@
+ #include <string>
+ #include <tuple>
+ 
++#ifdef HASHMAP_LLC_BENCH
++#include "benchmark/benchmark_hashmaps_llc.hpp"
++#define BENCHMARK_HASHMAPS BENCHMARK_HASHMAPS_LLC
++
++#else
++
+ #ifdef HASHMAP_COLLECT_META_INFO
+ #include "benchmark/benchmark_hashmaps_b.hpp"
+ #define BENCHMARK_HASHMAPS BENCHMARK_HASHMAPS_B
+@@ -71,6 +77,8 @@
+ 
+ #endif
+ 
++#endif
++
+ #include "benchmark/benchmark_shared.hpp"
+ #include "benchmark/read_benchmark.hpp"
+ #include "fmt/format.h"
+@@ -117,7 +125,15 @@ int main(int argc, char** argv) {
+   load_factors = {50, 70, 90};
+ #endif
+ 
++#ifdef HASHMAP_LLC_BENCH
++  load_factors = {90};
++#endif
++
+   std::vector<uint8_t> successful_query_rates{100, 75, 50, 25, 0};
++
++#ifdef HASHMAP_LLC_BENCH
++  successful_query_rates = {100};
++#endif
+   std::vector<uint64_t> hashtable_sizes{gcem::pow<uint64_t, uint64_t>(2, 27)};
+   std::vector<uint8_t> thread_counts = parse_thread_counts(argc, argv);
+ 
+@@ -149,10 +165,15 @@ int main(int argc, char** argv) {
+ #ifdef HASHMAP_COLLECT_META_INFO
+   bool warmup_run = false;
+   uint8_t runs_per_hashmap = 1;
++#else
++#ifdef HASHMAP_LLC_BENCH
++  bool warmup_run = false;
++  uint8_t runs_per_hashmap = 1;
+ #else
+   bool warmup_run = true;
+   uint8_t runs_per_hashmap = 3;
+ #endif
++#endif
+ 
+ #ifdef HASHMAP_STRINGKEYS
+   using KeyT = StringKey;
+@@ -203,6 +224,11 @@ int main(int argc, char** argv) {
+   using MultShift64Hasher = hashmap::hashing::MultShift64BHasher<KeyT, false>;
+ #endif
+ 
++#ifdef HASHMAP_LLC_BENCH
++  uint64_t num_hashmaps = get_num_hashmaps_llc();
++  spdlog::info("LLC miss benchmark (curated subset, LF=90, SQR=100).");
++  void* meta_collector_ptr = nullptr;
++#else
+ #ifdef HASHMAP_COLLECT_META_INFO
+   uint64_t num_hashmaps = get_num_hashmaps_b();
+   spdlog::info("We collect M E T A Information.");
+@@ -262,6 +288,7 @@ int main(int argc, char** argv) {
+ #endif
+ #endif
+   void* meta_collector_ptr = nullptr;
++#endif
+ #endif
+ 
+   uint64_t total_runs = thread_counts.size() * workloads.size() * hashtable_sizes.size() * data_distributions.size() * load_factors.size() *
+diff --git a/benchmark-include/benchmark/benchmark_hashmaps_llc.hpp b/benchmark-include/benchmark/benchmark_hashmaps_llc.hpp
+new file mode 100644
+index 0000000..328671b
+--- /dev/null
++++ b/benchmark-include/benchmark/benchmark_hashmaps_llc.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++#include <cstdint>
++
++/* READ BENCHMARK HASHMAPS LLC - curated subset for finding the highest LLC miss rate */
++
++namespace benchmark {
++
++uint64_t get_num_hashmaps_llc() {
++  uint64_t num_hashmaps = 0;
++
++#define LLC_BASE_BENCHMARK_HASHMAPS                                                                                              \
++  hashmaps::UnalignedLinearProbingAoSHashTable<KeyT, ValueT, DefaultHasher, false>,                                              \
++      hashmaps::UnalignedQuadraticProbingAoSHashTable<KeyT, ValueT, DefaultHasher, false>,                                       \
++      hashmaps::UnalignedRecalculatingRobinHoodAoSHashTable<KeyT, ValueT, DefaultHasher, false>,                                 \
++      hashmaps::StoringRobinHoodAoSHashTable<KeyT, ValueT, DefaultHasher, false>,                                                \
++      hashmaps::LinearProbingSoAHashTable<KeyT, ValueT, DefaultHasher, true>,                                                    \
++      hashmaps::LinearProbingPackedSoAHashTable<KeyT, ValueT, DefaultHasher, true>,                                              \
++      hashmaps::ChainedHashTable<KeyT, ValueT, DefaultHasher, false, hashmap::hashmaps::MemoryBudget::KeyValue, 10, true>,       \
++      hashmaps::ChainedHashTable<KeyT, ValueT, DefaultHasher, true, hashmap::hashmaps::MemoryBudget::KeyValue, 10, true>,        \
++      hashmaps::ChainedHashTable<KeyT, ValueT, DefaultHasher, true, hashmap::hashmaps::MemoryBudget::Bucket8FP, 10, true>
++  num_hashmaps += 9;
++
++#define LLC_SIMD_BENCHMARK_HASHMAPS                                                                                                                 \
++  hashmaps::UnchunkedSIMDSoAHashTable<KeyT, ValueT, DefaultHasher, 128, SIMDAlgorithm::TESTZ, false, false, NEONAlgo::SSE2NEON, false, false,       \
++                                      utils::PrefetchingLocality::NO, true>,                                                                        \
++      hashmaps::FingerprintingSIMDSoAHashTable<KeyT, ValueT, DefaultHasher, uint16_t, 128, SIMDAlgorithm::TESTZ, false, false, NEONAlgo::SSE2NEON,  \
++                                               false, false, utils::PrefetchingLocality::NO, true>,                                                 \
++      hashmaps::FingerprintingSIMDSoAHashTable<KeyT, ValueT, DefaultHasher, uint8_t, 128, SIMDAlgorithm::TESTZ, false, false, NEONAlgo::SSE2NEON,   \
++                                               false, false, utils::PrefetchingLocality::NO, true>,                                                 \
++      hashmaps::BucketingSIMDHashTable<KeyT, ValueT, DefaultHasher, uint16_t, hashmaps::KeyValueAoSStoringBucket, 8, 128, SIMDAlgorithm::TESTZ,     \
++                                       false, false, NEONAlgo::SSE2NEON, false, false, utils::PrefetchingLocality::MEDIUM, true, false>,            \
++      hashmaps::BucketingSIMDHashTable<KeyT, ValueT, DefaultHasher, uint8_t, hashmaps::KeyValueAoSStoringBucket, 16, 128, SIMDAlgorithm::TESTZ,     \
++                                       false, false, NEONAlgo::SSE2NEON, false, false, utils::PrefetchingLocality::MEDIUM, true, false>
++  num_hashmaps += 5;
++
++#define BENCHMARK_HASHMAPS_LLC LLC_BASE_BENCHMARK_HASHMAPS, LLC_SIMD_BENCHMARK_HASHMAPS
++
++  return num_hashmaps;
++}
++
++}  // namespace benchmark
+diff --git a/benchmark/app/qp_llc_bench.cpp b/benchmark/app/qp_llc_bench.cpp
+new file mode 100644
+index 0000000..b786d35
+--- /dev/null
++++ b/benchmark/app/qp_llc_bench.cpp
+@@ -0,0 +1,215 @@
++// Standalone QP-AoS lookup benchmark.
++//
++// Builds an UnalignedQuadraticProbingAoSHashTable<uint64_t,uint64_t> at a
++// given load factor, then runs a 100%-lookup workload across N worker
++// threads and prints wall-clock runtime and aggregate lookups/s.
++//
++// No in-app PerfMonitor — wrap the run with `perf stat` to read LLC and
++// other counters externally, e.g.:
++//
++//   perf stat -e LLC-load-misses,LLC-loads,instructions,cycles \
++//       numactl -N 0 -m 0 ./qp-llc-bench --threads 8
++//
++// Usage:
++//   qp-llc-bench [--threads N] [--lf 90] [--log2-size 27]
++//                [--queries-per-thread-mb 1024] [--seed 42]
++
++#include <atomic>
++#include <barrier>
++#include <chrono>
++#include <csignal>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <thread>
++#include <unistd.h>
++#include <unordered_set>
++#include <vector>
++
++#include "hashmap/hashes/multshifthasher.hpp"
++#include "hashmap/hashmaps/quadratic_probing_aos.hpp"
++
++using KeyT = uint64_t;
++using ValueT = uint64_t;
++using Hasher = hashmap::hashing::MultShift64BHasher<KeyT, /*modulo=*/false>;
++using HashTable = hashmap::hashmaps::UnalignedQuadraticProbingAoSHashTable<KeyT, ValueT, Hasher, /*use_prefetching=*/false>;
++
++struct Config {
++  uint32_t threads = 8;
++  uint8_t load_factor = 90;
++  uint8_t log2_size = 27;             // 2^27 = 128M slots ≈ 2 GiB
++  uint32_t queries_per_thread_mb = 1024;  // 1 GiB of 8-byte keys per thread
++  uint64_t seed = 42;
++  bool pause_before_lookup = false;   // print PID and wait for SIGUSR1
++};
++
++static volatile sig_atomic_t g_resume = 0;
++static void sigusr1_handler(int) { g_resume = 1; }
++
++static inline uint64_t hash_knuth(uint64_t x) {
++  return x * 11400714819323198485ULL;
++}
++
++static Config parse_args(int argc, char** argv) {
++  Config c;
++  for (int i = 1; i < argc; ++i) {
++    std::string a = argv[i];
++    auto next = [&]() -> std::string {
++      if (i + 1 >= argc) {
++        std::fprintf(stderr, "missing value for %s\n", a.c_str());
++        std::exit(2);
++      }
++      return argv[++i];
++    };
++    if (a == "--threads") c.threads = static_cast<uint32_t>(std::stoul(next()));
++    else if (a == "--lf") c.load_factor = static_cast<uint8_t>(std::stoul(next()));
++    else if (a == "--log2-size") c.log2_size = static_cast<uint8_t>(std::stoul(next()));
++    else if (a == "--queries-per-thread-mb") c.queries_per_thread_mb = static_cast<uint32_t>(std::stoul(next()));
++    else if (a == "--seed") c.seed = std::stoull(next());
++    else if (a == "--pause-before-lookup") c.pause_before_lookup = true;
++    else if (a == "-h" || a == "--help") {
++      std::printf(
++          "qp-llc-bench: standalone QP-AoS lookup benchmark\n"
++          "  --threads N                (default 8; power of two recommended)\n"
++          "  --lf 90                    target load factor in %%\n"
++          "  --log2-size 27             total table size = 2^N entries\n"
++          "  --queries-per-thread-mb 1024  query workload per thread, in MiB of keys\n"
++          "  --seed 42                  base RNG seed\n"
++          "  --pause-before-lookup      after prep, print PID and wait for SIGUSR1\n"
++          "                              (so external `perf stat -p PID` can scope\n"
++          "                               to just the lookup phase)\n");
++      std::exit(0);
++    } else {
++      std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
++      std::exit(2);
++    }
++  }
++  return c;
++}
++
++// Generate `count` unique uint64 keys, seeded deterministically.
++static std::vector<KeyT> unique_keys(uint64_t count, uint64_t seed) {
++  std::vector<KeyT> out;
++  out.reserve(count);
++  std::unordered_set<KeyT> seen;
++  seen.reserve(count * 2);
++  std::mt19937_64 rng(seed);
++  std::uniform_int_distribution<KeyT> dist(1, std::numeric_limits<KeyT>::max() - 1);
++  while (out.size() < count) {
++    KeyT k = dist(rng);
++    if (seen.insert(k).second) out.push_back(k);
++  }
++  return out;
++}
++
++struct ThreadOut {
++  uint64_t lookups = 0;
++  uint64_t runtime_ns = 0;
++  uint64_t checksum = 0;
++};
++
++int main(int argc, char** argv) {
++  Config cfg = parse_args(argc, argv);
++
++  const uint64_t total_slots = 1ULL << cfg.log2_size;
++  if (total_slots % cfg.threads != 0) {
++    std::fprintf(stderr, "table size 2^%u not divisible by %u threads\n", cfg.log2_size, cfg.threads);
++    return 2;
++  }
++  const uint64_t thread_slots = total_slots / cfg.threads;
++  const uint64_t fill_per_thread = static_cast<uint64_t>(thread_slots) * cfg.load_factor / 100ULL;
++  const uint64_t queries_per_thread = (static_cast<uint64_t>(cfg.queries_per_thread_mb) * 1024ULL * 1024ULL) / sizeof(KeyT);
++
++  std::printf("Config: threads=%u  lf=%u%%  log2_size=%u  thread_slots=%lu  fill/thr=%lu  queries/thr=%lu\n",
++              cfg.threads, cfg.load_factor, cfg.log2_size,
++              static_cast<unsigned long>(thread_slots),
++              static_cast<unsigned long>(fill_per_thread),
++              static_cast<unsigned long>(queries_per_thread));
++
++  // Per-thread per-thread-private hash tables; same construction as the
++  // upstream read benchmark.
++  std::vector<std::unique_ptr<HashTable>> tables(cfg.threads);
++  std::vector<ThreadOut> outs(cfg.threads);
++
++  // Build fill data per thread, then insert. Queries are generated on the fly
++  // in the timed loop so prep does not allocate per-thread query buffers.
++  for (uint32_t t = 0; t < cfg.threads; ++t) {
++    std::printf("[prep] thread %u: generating %lu unique keys...\n", t,
++                static_cast<unsigned long>(fill_per_thread));
++    auto fill_keys = unique_keys(fill_per_thread, cfg.seed + t * 2 + 1);
++
++    tables[t] = std::make_unique<HashTable>(thread_slots, cfg.load_factor);
++    if (!tables[t]->can_be_used()) {
++      std::fprintf(stderr, "table not usable for thread %u (lf %u%%)\n", t, cfg.load_factor);
++      return 1;
++    }
++    tables[t]->prefault();
++    for (const auto& k : fill_keys) tables[t]->insert(k, k ^ 0x9e3779b97f4a7c15ULL);
++  }
++
++  if (cfg.pause_before_lookup) {
++    std::signal(SIGUSR1, sigusr1_handler);
++    std::fflush(stdout);
++    std::printf("READY pid=%d  — attach with: perf stat -p %d -e LLC-load-misses,LLC-loads ; then `kill -USR1 %d`\n",
++                getpid(), getpid(), getpid());
++    std::fflush(stdout);
++    while (!g_resume) pause();
++  }
++
++  std::printf("[run] starting %u worker threads...\n", cfg.threads);
++
++  // Sync threads in and out of the timed region with a barrier; measure
++  // wall time on the main thread, identical to the upstream benchmark.
++  std::barrier sync(static_cast<std::ptrdiff_t>(cfg.threads + 1));
++  std::vector<std::thread> workers;
++  workers.reserve(cfg.threads);
++
++  for (uint32_t t = 0; t < cfg.threads; ++t) {
++    workers.emplace_back([&, t]() {
++      HashTable& ht = *tables[t];
++      sync.arrive_and_wait();  // ready
++
++      uint64_t sum = 0;
++      auto start = std::chrono::high_resolution_clock::now();
++      for (uint64_t request_num = 0; request_num < queries_per_thread; ++request_num) {
++        const KeyT k = hash_knuth(static_cast<uint64_t>(t) + request_num);
++        sum += ht.lookup(k);
++        asm volatile("" : "+r"(sum) : : "memory");
++      }
++      auto end = std::chrono::high_resolution_clock::now();
++      outs[t].runtime_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
++      outs[t].lookups = queries_per_thread;
++      outs[t].checksum = sum;
++
++      sync.arrive_and_wait();  // done
++    });
++  }
++
++  sync.arrive_and_wait();  // release workers
++  auto wall_start = std::chrono::high_resolution_clock::now();
++  sync.arrive_and_wait();  // wait for completion
++  auto wall_end = std::chrono::high_resolution_clock::now();
++  for (auto& w : workers) w.join();
++
++  const double wall_s = std::chrono::duration<double>(wall_end - wall_start).count();
++  uint64_t total_lookups = 0;
++  uint64_t checksum = 0;
++  uint64_t max_thread_ns = 0;
++  for (const auto& o : outs) {
++    total_lookups += o.lookups;
++    checksum ^= o.checksum;
++    if (o.runtime_ns > max_thread_ns) max_thread_ns = o.runtime_ns;
++  }
++
++  const double lps = static_cast<double>(total_lookups) / wall_s;
++  std::printf("\n=== result ===\n");
++  std::printf("wall_runtime_ms       = %.2f\n", wall_s * 1000.0);
++  std::printf("max_thread_runtime_ms = %.2f\n", max_thread_ns / 1e6);
++  std::printf("total_lookups         = %lu\n", static_cast<unsigned long>(total_lookups));
++  std::printf("aggregate_lookups_s   = %.3e  (%.1f M/s)\n", lps, lps / 1e6);
++  std::printf("checksum              = 0x%016lx\n", static_cast<unsigned long>(checksum));
++  return 0;
++}

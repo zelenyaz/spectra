@@ -1,0 +1,208 @@
+diff --git a/tpp/colloid-mon/Makefile b/tpp/colloid-mon/Makefile
+index 0a586ff4c..8d059cbf7 100644
+--- a/tpp/colloid-mon/Makefile
++++ b/tpp/colloid-mon/Makefile
+@@ -49,6 +49,18 @@ else ifeq ($(BACKEND), hsw-native)
+         $(error Backend $(BACKEND) does not support tier $(ALTERNATE_TIER).)
+     endif
+     endif
++else ifeq ($(BACKEND), spr-native)
++    colloid-mon-objs += backend/spr-native.o
++    ifneq ($(DEFAULT_TIER), local-dram)
++    ifneq ($(DEFAULT_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(DEFAULT_TIER).)
++    endif
++    endif
++    ifneq ($(ALTERNATE_TIER), local-dram)
++    ifneq ($(ALTERNATE_TIER), remote-dram)
++        $(error Backend $(BACKEND) does not support tier $(ALTERNATE_TIER).)
++    endif
++    endif
+ else
+ 	$(error Invalid backend: $(BACKEND).)
+ endif
+diff --git a/tpp/colloid-mon/backend/spr-native.c b/tpp/colloid-mon/backend/spr-native.c
+new file mode 100644
+index 000000000..817c325d7
+--- /dev/null
++++ b/tpp/colloid-mon/backend/spr-native.c
+@@ -0,0 +1,92 @@
++#include "backend_iface.h"
++#include <linux/kernel.h>
++#include <asm/msr.h>
++
++#define CHA_BOX_STRIDE           0x10ULL
++#define CHA_MSR_PMON_BASE        0x2000ULL
++#define CHA_MSR_CTL0_BASE        0x2002ULL
++#define CHA_MSR_CTR0_BASE        0x2008ULL
++#define CHA_MSR_FILTER0_BASE     0x200EULL
++#define CHA_MSR_STATUS_BASE      0x2001ULL
++
++
++#define NUM_CHA_BOXES 28
++#define NUM_CHA_COUNTERS 4
++
++static int core_mon;
++
++int backend_init(struct backend_config* config) {
++    int cha, ret;
++    u32 msr_num;
++    u64 msr_val;
++
++    if (!config) {
++        printk(KERN_ERR "spr-native: invalid backend_config passed\n");
++        return -1;
++    }
++
++    core_mon = config->core;
++    pr_info("colloid: core mon %d\n", core_mon);
++
++    for (cha = 0; cha < NUM_CHA_BOXES; cha++) {
++        msr_num = CHA_MSR_FILTER0_BASE + (CHA_BOX_STRIDE * cha); // Filter0
++        msr_val = 0x00000000; // default; no filtering
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if (ret != 0) {
++            printk(KERN_ERR "spr-native: wrmsr FILTER0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_CTL0_BASE + (CHA_BOX_STRIDE * cha) + 0; // counter 0
++        msr_val = (cha%2==0)?(0x00c8168600000136):(0x00c8170600000136); // TOR Occupancy, DRd, Miss, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "spr-native: wrmsr COUNTER 0 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_CTL0_BASE + (CHA_BOX_STRIDE * cha) + 1; // counter 1
++        msr_val = (cha%2==0)?(0x00c8168600000135):(0x00c8170600000135); // TOR Inserts, DRd, Miss, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR " spr-native: wrmsr COUNTER 1 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_CTL0_BASE + (CHA_BOX_STRIDE * cha) + 2; // counter 2
++        msr_val = 0x1; // CLOCKTICKS
++        ret = wrmsr_on_cpu(core_mon, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "spr-native: wrmsr COUNTER 2 failed\n");
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++int backend_destroy() {
++    return 0;
++}
++
++
++u64 backend_read_occupancy(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 0; // Occupancy
++    msr_num = CHA_MSR_CTR0_BASE + (CHA_BOX_STRIDE * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
++u64 backend_read_inserts(int tier) {
++    int cha, ctr;
++    u32 msr_num, msr_high, msr_low;
++    cha = tier; // Default tier on CHA slice 0, Alternate tier on CHA slice 1
++    ctr = 1; // Inserts
++    msr_num = CHA_MSR_CTR0_BASE + (CHA_BOX_STRIDE * cha) + ctr;    
++    rdmsr_on_cpu(core_mon, msr_num, &msr_low, &msr_high);
++    return ((((u64)msr_high) << 32) | ((u64)msr_low));
++}
++
+diff --git a/tpp/colloid-mon/config.mk b/tpp/colloid-mon/config.mk
+index 74bb2ff22..2f27d2e46 100644
+--- a/tpp/colloid-mon/config.mk
++++ b/tpp/colloid-mon/config.mk
+@@ -6,7 +6,8 @@
+ # 	icx-native: Intel Icelake (native)
+ # 	clx-native: Intel Cascadelake (native)
+ # 	hsw-native: Intel Haswell (native)
+-BACKEND ?= icx-native
++#   spr-native: Intel Sapphire Rapids (native)
++BACKEND ?= spr-native
+ 
+ # Default/alternate tier types
+ # Currently supported tier types
+@@ -16,8 +17,8 @@ DEFAULT_TIER ?= local-dram
+ ALTERNATE_TIER ?= remote-dram
+ 
+ # NUMA node for default tier
+-DEFAULT_TIER_NUMA ?= 1
++DEFAULT_TIER_NUMA ?= 0
+ 
+ # Core on which to run latency measurement
+ # Should be a dedicated core on the default tier socket
+-CORE_MON ?= 63
+\ No newline at end of file
++CORE_MON ?= 27
+diff --git a/tpp/colloid-mon/frontend.c b/tpp/colloid-mon/frontend.c
+index ca1fe755e..e159cb785 100644
+--- a/tpp/colloid-mon/frontend.c
++++ b/tpp/colloid-mon/frontend.c
+@@ -10,7 +10,7 @@
+ #include <linux/delay.h>
+ #include "backend/backend_iface.h"
+ 
+-#define SPINPOLL // TODO: configure this
++// #define SPINPOLL // TODO: configure this
+ #define SAMPLE_INTERVAL_MS 10 // Only used if SPINPOLL is not set
+ #ifdef SPINPOLL
+ #define EWMA_EXP 5
+diff --git a/tpp/memeater/memeater.c b/tpp/memeater/memeater.c
+index 22b6e6ca5..4826fcd50 100644
+--- a/tpp/memeater/memeater.c
++++ b/tpp/memeater/memeater.c
+@@ -11,8 +11,8 @@
+ #include <linux/moduleparam.h>
+ #include <linux/memory-tiers.h>
+ 
+-#define FARMEM_NUMA 0
+-#define LOCAL_NUMA 1
++#define FARMEM_NUMA 1
++#define LOCAL_NUMA 0
+ 
+ 
+ static int sizeMiB = 0;
+diff --git a/tpp/tierinit/offline_cpus.sh b/tpp/tierinit/offline_cpus.sh
+index d7e6ebc87..2667ea8a9 100755
+--- a/tpp/tierinit/offline_cpus.sh
++++ b/tpp/tierinit/offline_cpus.sh
+@@ -1,3 +1,3 @@
+-for i in 2 6 10 14 18 22 26 30 34 38 42 46 50 54 58 62; do
++for i in 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55; do
+ 	echo 0 > /sys/devices/system/cpu/cpu$i/online
+ done
+diff --git a/tpp/tierinit/online_cpus.sh b/tpp/tierinit/online_cpus.sh
+index 6b2f9f255..c800f5626 100755
+--- a/tpp/tierinit/online_cpus.sh
++++ b/tpp/tierinit/online_cpus.sh
+@@ -1,3 +1,3 @@
+-for i in 2 6 10 14 18 22 26 30 34 38 42 46 50 54 58 62; do
++for i in 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55; do
+ 	echo 1 > /sys/devices/system/cpu/cpu$i/online
+ done
+diff --git a/tpp/tierinit/tierinit.c b/tpp/tierinit/tierinit.c
+index 8411d6bb6..8ea7431e0 100644
+--- a/tpp/tierinit/tierinit.c
++++ b/tpp/tierinit/tierinit.c
+@@ -9,8 +9,8 @@
+ #include <linux/memory-tiers.h>
+ 
+ #define MEMTIER_DEFAULT_FARMEM_ADISTANCE	(MEMTIER_ADISTANCE_DRAM * 10)
+-#define FARMEM_NUMA 0
+-#define LOCAL_NUMA 1
++#define FARMEM_NUMA 1
++#define LOCAL_NUMA 0
+ 
+ static struct memory_dev_type *farmem_type;
+  

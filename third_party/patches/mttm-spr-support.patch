@@ -1,0 +1,647 @@
+diff --git a/linux-5.15.145/Makefile b/linux-5.15.145/Makefile
+index d46825496..4d203e5a7 100644
+--- a/linux-5.15.145/Makefile
++++ b/linux-5.15.145/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 15
+ SUBLEVEL = 145
+-EXTRAVERSION =
++EXTRAVERSION = -mttm
+ NAME = Trick or Treat
+ 
+ # *DOCUMENTATION*
+diff --git a/linux-5.15.145/arch/x86/entry/syscalls/syscall_64.tbl b/linux-5.15.145/arch/x86/entry/syscalls/syscall_64.tbl
+index 0379a3d5b..b4f7649ca 100644
+--- a/linux-5.15.145/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/linux-5.15.145/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,10 +370,10 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
+-449	common	mttm_register_pid	sys_mttm_register_pid
+-450	common	mttm_unregister_pid	sys_mttm_unregister_pid
+-451	common	vtmm_register_pid	sys_vtmm_register_pid
+-452	common	vtmm_unregister_pid	sys_vtmm_unregister_pid
++598	common	mttm_register_pid	sys_mttm_register_pid
++599	common	mttm_unregister_pid	sys_mttm_unregister_pid
++600	common	vtmm_register_pid	sys_vtmm_register_pid
++601	common	vtmm_unregister_pid	sys_vtmm_unregister_pid
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/linux-5.15.145/include/linux/mttm.h b/linux-5.15.145/include/linux/mttm.h
+index f82e26ac9..3e4fd5213 100644
+--- a/linux-5.15.145/include/linux/mttm.h
++++ b/linux-5.15.145/include/linux/mttm.h
+@@ -6,7 +6,7 @@
+ #define KSAMPLED_CPU		0
+ #define KPTSCAND_CPU		0
+ #define LIMIT_TENANTS		20
+-#define CORES_PER_SOCKET	24
++#define CORES_PER_SOCKET	28
+ #define SAMPLE_RATE_STABLE_CNT	10
+ #define PEBS_INIT_PERIOD	4999
+ #define PEBS_STABLE_PERIOD	10007
+@@ -37,12 +37,19 @@
+ //      Offset 6 is Filter1 -- lots of filter bits, including opcode -- default if unused should be 0x03b, or 0x------33 if using opcode matching
+ //      Offset 7 is Unit Status
+ //      Offsets 8,9,A,B are the Counter count registers
++#if 0
+ #define CHA_MSR_PMON_BASE 0x0E00L
+ #define CHA_MSR_PMON_CTL_BASE 0x0E01L
+ #define CHA_MSR_PMON_FILTER0_BASE 0x0E05L
+ #define CHA_MSR_PMON_FILTER1_BASE 0x0E06L
+ #define CHA_MSR_PMON_STATUS_BASE 0x0E07L
+ #define CHA_MSR_PMON_CTR_BASE 0x0E08L
++#endif
++#define CHA_MSR_PMON_BASE 0x2000L
++#define CHA_MSR_PMON_CTL_BASE 0x2002L
++#define CHA_MSR_PMON_FILTER0_BASE 0x200EL
++#define CHA_MSR_PMON_STATUS_BASE 0x2001L
++#define CHA_MSR_PMON_CTR_BASE 0x2008L
+ 
+ #define NUM_CHA_BOXES 28
+ #define NUM_CHA_COUNTERS 4
+@@ -59,10 +66,49 @@
+ #define TOR_CORE_MON 1
+ #define RxC_CORE_MON 2
+ 
+-//IMC
++//IMC (Sapphire Rapids: 4 iMCs/socket x 2 channels/iMC = 8 channels/socket).
++//PMON state lives in MMIO; PCICFG only holds the BAR/offset pointers
++//(Intel Uncore Performance Monitoring Guide for SPR XCC, Section 1.10.3).
+ #define NUM_SOCKETS             2
+-#define NUM_IMC_CHANNELS        6 //per socket
+-#define NUM_IMC_COUNTERS        5 //4 + 1(DCLK)
++#define NUM_IMC_PER_SOCKET      4
++#define NUM_CH_PER_IMC          2
++#define NUM_IMC_CHANNELS        (NUM_IMC_PER_SOCKET * NUM_CH_PER_IMC)
++#define NUM_IMC_COUNTERS        5 //index [0]=read, [1]=write, [4]=clockticks (others unused)
++
++/* SPR IMC PCI device: VID=0x8086, DID=0x3251, B?:D0:F1 (one per socket) */
++#define SPR_IMC_PCI_DID                 0x3251
++
++/* PCICFG offsets for resolving the MMIO address (Section 1.10.3) */
++#define SPR_IMC_MMIO_BASE_OFFSET        0xd0
++#define SPR_IMC_MMIO_BASE_MASK          0x1FFFFFFFUL
++#define SPR_IMC_MMIO_BASE_SHIFT         23
++#define SPR_IMC_MMIO_MEM0_OFFSET        0xd8
++#define SPR_IMC_MMIO_MEM_STRIDE         0x04
++#define SPR_IMC_MMIO_MEM_MASK           0x7FFUL
++#define SPR_IMC_MMIO_MEM_SHIFT          12
++#define SPR_IMC_MMIO_CHN_OFFSET         0x22800
++#define SPR_IMC_MMIO_CHN_STRIDE         0x8000
++#define SPR_IMC_MMIO_SIZE               0x4000
++
++/* Per-channel PMON register offsets, relative to the channel's BOX_CTL */
++#define SPR_IMC_PMON_BOX_CTL            0x00
++#define SPR_IMC_PMON_BOX_STATUS         0x5C
++#define SPR_IMC_PMON_CTR(n)             (0x08 + 8 * (n))   /* n = 0..3, 48-bit */
++#define SPR_IMC_PMON_CTL(n)             (0x40 + 4 * (n))   /* n = 0..3 */
++
++/* Cn_MSR_PMON_CTL bits (Table 1-7) and Box CTL bits (Table 1-5) */
++#define SPR_IMC_PMON_CTL_EN             (1U << 22)
++#define SPR_IMC_PMON_BOX_CTL_RST_CTRS   (1U <<  1)
++#define SPR_IMC_PMON_BOX_CTL_FRZ        (1U <<  8)
++
++/* SPR DDR5 iMC events (Table 2-138). PCH0|PCH1 bits in umask[15:14]. */
++#define SPR_IMC_EVT_CAS_COUNT           0x05
++#define SPR_IMC_UMASK_CAS_RD            0xCF /* b11001111: PCH0|PCH1, RD */
++#define SPR_IMC_UMASK_CAS_WR            0xF0 /* b11110000: PCH0|PCH1, WR */
++#define SPR_IMC_EVT_CLOCKTICKS          0x01
++
++#define SPR_IMC_PMON_CTL_VAL(evt, umask) \
++    (SPR_IMC_PMON_CTL_EN | (((u32)(umask)) << 8) | (u32)(evt))
+ 
+ 
+ struct mttm_event {
+diff --git a/linux-5.15.145/kernel/sysctl.c b/linux-5.15.145/kernel/sysctl.c
+index 9a2c61031..52baa3179 100644
+--- a/linux-5.15.145/kernel/sysctl.c
++++ b/linux-5.15.145/kernel/sysctl.c
+@@ -192,7 +192,8 @@ static int max_extfrag_threshold = 1000;
+ extern int enable_ksampled;
+ extern int enable_kptscand;
+ extern char mttm_local_dram_string[];
+-extern unsigned long pebs_sample_period;
++extern unsigned long pebs_init_period;
++extern unsigned long pebs_stable_period;
+ extern unsigned int use_dram_determination;
+ extern unsigned int use_static_dram;
+ extern unsigned int use_rxc_monitoring;
+@@ -2912,8 +2913,15 @@ static struct ctl_table vm_table[] = {
+ 		.proc_handler	= sysctl_mttm_local_dram,
+ 	},
+ 	{
+-		.procname	= "pebs_sample_period",
+-		.data		= &pebs_sample_period,
++		.procname	= "pebs_init_period",
++		.data		= &pebs_init_period,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0644,
++		.proc_handler	= proc_doulongvec_minmax,
++	},
++	{
++		.procname	= "pebs_stable_period",
++		.data		= &pebs_stable_period,
+ 		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+diff --git a/linux-5.15.145/mm/mttm_sample.c b/linux-5.15.145/mm/mttm_sample.c
+index 0fad566de..7aa55dd0a 100644
+--- a/linux-5.15.145/mm/mttm_sample.c
++++ b/linux-5.15.145/mm/mttm_sample.c
+@@ -32,7 +32,9 @@
+ 
+ 
+ int enable_ksampled = 0;
+-unsigned long pebs_sample_period = PEBS_INIT_PERIOD;
++static unsigned long pebs_sample_period = PEBS_INIT_PERIOD;
++unsigned long pebs_init_period = PEBS_INIT_PERIOD;
++unsigned long pebs_stable_period = PEBS_STABLE_PERIOD;
+ unsigned int check_stable_sample_rate = 1;
+ unsigned int use_dram_determination = 1;
+ unsigned int use_static_dram = 0;
+@@ -76,16 +78,160 @@ u64 smoothed_rxc_reject_local = 0, smoothed_rxc_reject_remote = 0;
+ u64 smoothed_rxc_reject_ratio_local = 0, smoothed_rxc_reject_ratio_remote = 0;
+ 
+ 
+-int IMC_BUS_SOCKET[2] = {0x3a, 0xae};
+-int IMC_DEVICE_CHANNEL[6] = {0x0a, 0x0a, 0x0b, 0x0c, 0x0c, 0x0d};
+-int IMC_FUNCTION_CHANNEL[6] = {0x2, 0x6, 0x2, 0x2, 0x6, 0x2};
+-int IMC_PMONCTRL_OFFSET[5] = {0xd8, 0xdc, 0xe0, 0xe4, 0xf0};
+-int IMC_PMONCTR_OFFSET[5] = {0xa0, 0xa8, 0xb0, 0xb8, 0xd0};
++/*
++ * Sapphire Rapids IMC PMON access goes through MMIO. For each (socket, iMC,
++ * channel) tuple we resolve a physical address from PCICFG (DID 0x3251,
++ * Section 1.10.3 of the SPR Uncore Performance Monitoring Guide) and ioremap
++ * a SPR_IMC_MMIO_SIZE-byte window covering that channel's PMON box.
++ */
++static void __iomem *spr_imc_mmio[NUM_SOCKETS][NUM_IMC_PER_SOCKET][NUM_CH_PER_IMC];
++static struct pci_dev *spr_imc_pdev[NUM_SOCKETS];
++
+ uint64_t cur_imc_counts[NUM_SOCKETS][NUM_IMC_CHANNELS][NUM_IMC_COUNTERS] = {0,};
+ uint64_t prev_imc_counts[NUM_SOCKETS][NUM_IMC_CHANNELS][NUM_IMC_COUNTERS] = {0,};
+ unsigned long cur_bw_jiffies, prev_bw_jiffies;
+ unsigned long smoothed_bw_local = 0, smoothed_bw_remote = 0;
+ 
++static inline int spr_imc_chan_idx(int imc, int ch)
++{
++    return imc * NUM_CH_PER_IMC + ch;
++}
++
++static void spr_imc_unmap_all(void)
++{
++    int s, i, c;
++    for (s = 0; s < NUM_SOCKETS; s++) {
++        for (i = 0; i < NUM_IMC_PER_SOCKET; i++) {
++            for (c = 0; c < NUM_CH_PER_IMC; c++) {
++                if (spr_imc_mmio[s][i][c]) {
++                    iounmap(spr_imc_mmio[s][i][c]);
++                    spr_imc_mmio[s][i][c] = NULL;
++                }
++            }
++        }
++        if (spr_imc_pdev[s]) {
++            pci_dev_put(spr_imc_pdev[s]);
++            spr_imc_pdev[s] = NULL;
++        }
++    }
++}
++
++/*
++ * Resolve and ioremap every (iMC, channel) PMON box for every socket.
++ * Each socket has a single PCI function (VID 0x8086, DID 0x3251) at B?:D0:F1
++ * that publishes one base register and four MEMn offset registers, encoding
++ * the physical address of the four iMCs' MMIO regions. Each iMC contains two
++ * channel-level PMON boxes at +0x22800 and +0x2A800.
++ */
++static int spr_imc_init(void)
++{
++    struct pci_dev *pdev = NULL;
++    int socket = 0;
++    int imc, ch;
++    u32 base_dword, mem_dword;
++    resource_size_t base, addr;
++
++    while ((pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
++                                  SPR_IMC_PCI_DID, pdev)) != NULL) {
++        if (socket >= NUM_SOCKETS) {
++            pci_dev_put(pdev);
++            break;
++        }
++
++        if (pci_read_config_dword(pdev, SPR_IMC_MMIO_BASE_OFFSET,
++                                  &base_dword)) {
++            pr_err("[mttm] iMC: pci_read_config_dword(BASE) failed sock=%d\n",
++                   socket);
++            pci_dev_put(pdev);
++            spr_imc_unmap_all();
++            return -EIO;
++        }
++        base = ((resource_size_t)(base_dword & SPR_IMC_MMIO_BASE_MASK))
++               << SPR_IMC_MMIO_BASE_SHIFT;
++
++        for (imc = 0; imc < NUM_IMC_PER_SOCKET; imc++) {
++            int memn_off = SPR_IMC_MMIO_MEM0_OFFSET +
++                           imc * SPR_IMC_MMIO_MEM_STRIDE;
++            if (pci_read_config_dword(pdev, memn_off, &mem_dword)) {
++                pr_err("[mttm] iMC: pci_read_config_dword(MEM%d) failed sock=%d\n",
++                       imc, socket);
++                pci_dev_put(pdev);
++                spr_imc_unmap_all();
++                return -EIO;
++            }
++            addr = base | (((resource_size_t)(mem_dword & SPR_IMC_MMIO_MEM_MASK))
++                           << SPR_IMC_MMIO_MEM_SHIFT);
++
++            for (ch = 0; ch < NUM_CH_PER_IMC; ch++) {
++                resource_size_t ch_addr = addr + SPR_IMC_MMIO_CHN_OFFSET +
++                                          ch * SPR_IMC_MMIO_CHN_STRIDE;
++                spr_imc_mmio[socket][imc][ch] =
++                    ioremap(ch_addr, SPR_IMC_MMIO_SIZE);
++                if (!spr_imc_mmio[socket][imc][ch]) {
++                    pr_err("[mttm] iMC: ioremap failed sock=%d imc=%d ch=%d addr=%pa\n",
++                           socket, imc, ch, &ch_addr);
++                    pci_dev_put(pdev);
++                    spr_imc_unmap_all();
++                    return -ENOMEM;
++                }
++            }
++        }
++
++        /* keep the pdev alive for the lifetime of the mapping */
++        spr_imc_pdev[socket] = pci_dev_get(pdev);
++        socket++;
++    }
++
++    if (socket < NUM_SOCKETS) {
++        pr_err("[mttm] iMC: only %d/%d sockets found (DID 0x%x)\n",
++               socket, NUM_SOCKETS, SPR_IMC_PCI_DID);
++        spr_imc_unmap_all();
++        return -ENODEV;
++    }
++    return 0;
++}
++
++/*
++ * Program one (socket, iMC, channel) PMON box: freeze, reset, install events,
++ * unfreeze. Counter assignment matches the legacy [0]=read, [1]=write,
++ * [4]=clockticks layout used elsewhere in this file.
++ */
++static void spr_imc_program_box(int socket, int imc, int ch)
++{
++    void __iomem *base = spr_imc_mmio[socket][imc][ch];
++    if (!base)
++        return;
++
++    /* Freeze and reset counters */
++    writel(SPR_IMC_PMON_BOX_CTL_FRZ | SPR_IMC_PMON_BOX_CTL_RST_CTRS,
++           base + SPR_IMC_PMON_BOX_CTL);
++
++    writel(SPR_IMC_PMON_CTL_VAL(SPR_IMC_EVT_CAS_COUNT,
++                                 SPR_IMC_UMASK_CAS_RD),
++           base + SPR_IMC_PMON_CTL(0));
++    writel(SPR_IMC_PMON_CTL_VAL(SPR_IMC_EVT_CAS_COUNT,
++                                 SPR_IMC_UMASK_CAS_WR),
++           base + SPR_IMC_PMON_CTL(1));
++    writel(SPR_IMC_PMON_CTL_VAL(SPR_IMC_EVT_CLOCKTICKS, 0),
++           base + SPR_IMC_PMON_CTL(2));
++
++    /* Unfreeze */
++    writel(0, base + SPR_IMC_PMON_BOX_CTL);
++}
++
++/*
++ * Read a 48-bit IMC counter at the given offset. The counter spans two
++ * 32-bit dwords; readq isn't safe on all platforms for MMIO so we issue
++ * two readl's and stitch them together. Top 16 bits of the counter are
++ * undefined per the manual; we mask to 48 bits.
++ */
++static inline u64 spr_imc_read_ctr(void __iomem *base, unsigned int off)
++{
++    u32 lo = readl(base + off);
++    u32 hi = readl(base + off + 4);
++    return ((((u64)hi) << 32) | (u64)lo) & ((1ULL << 48) - 1);
++}
++
+ 
+ uint64_t to_BW(uint64_t nr_event, unsigned long elapsed)
+ {
+@@ -527,7 +673,7 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
+ 	attr.config = config;
+ 	attr.config1 = config1;
+ 
+-	attr.sample_period = pebs_sample_period;
++	attr.sample_period = READ_ONCE(pebs_init_period);
+ 
+ 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
+ 
+@@ -2019,11 +2165,7 @@ static int backend_init(void) {
+     int cha, ret;
+     u32 msr_num;
+     u64 msr_val;
+-
+-    int socket, channel, bus, device, function, value;
+-    int offset_rd, offset_wr, offset_dclk;
+-    struct pci_bus *pci_bus;   
+-    int err;
++    int socket;
+ 
+     smoothed_occ_local = 0, smoothed_inserts_local = 0;
+     smoothed_occ_remote = 0, smoothed_inserts_remote = 0;
+@@ -2032,6 +2174,7 @@ static int backend_init(void) {
+     smoothed_rxc_reject_local = 0, smoothed_rxc_reject_remote = 0;
+     smoothed_rxc_reject_ratio_local = 0, smoothed_rxc_reject_ratio_remote = 0;
+ 
++#if 0
+     // TOR, RxC
+     for(cha = 0; cha < NUM_CHA_BOXES; cha++) {
+         msr_num = CHA_MSR_PMON_FILTER0_BASE + (0x10 * cha); // Filter0
+@@ -2081,41 +2224,69 @@ static int backend_init(void) {
+             printk(KERN_ERR "wrmsr COUNTER 3 failed\n");
+             return -1;
+         }
++    }
++#endif
+ 
++	// TOR, RxC for SPR
++	// TOR events: unc_cha_tor_occupancy, unc_cha_tor_inserts with .ia_drd_local, .ia_drd_remote
++    for(cha = 0; cha < NUM_CHA_BOXES; cha++) {
++        msr_num = CHA_MSR_PMON_FILTER0_BASE + (0x10 * cha); // Filter0
++        msr_val = 0x00000000; // default; no filtering
++        ret = wrmsr_on_cpu(TOR_CORE_MON, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr FILTER0 failed\n");
++            return -1;
++        }
+ 
+-    }
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 0; // counter 0
++        msr_val = (cha%2==0)?(0xc816fe00000136):(0xc8177e00000136); // TOR Occupancy, Drd, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(TOR_CORE_MON, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 0 failed\n");
++            return -1;
++        }
+ 
+-    // IMC
+-    pci_bus = pci_find_bus(0, 0);
+-    if(pci_bus) {
+-        err = pci_bus_read_config_dword(pci_bus, PCI_DEVFN(0x05, 0), 0, &value);
+-        pr_info("[%s] pci_bus found. value: 0x%x\n",
+-                __func__, value);
+-    }
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 1; // counter 1
++        msr_val =  (cha%2==0)?(0xc816fe00000135):(0xc8177e00000135); // TOR Inserts, Drd, local/remote on even/odd CHA boxes
++        ret = wrmsr_on_cpu(TOR_CORE_MON, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 1 failed\n");
++            return -1;
++        }
+ 
+-    // set control register
+-    for(socket = 0; socket < NUM_SOCKETS; socket++) {
+-        bus = IMC_BUS_SOCKET[socket];
+-        for(channel = 0; channel < NUM_IMC_CHANNELS; channel++) {
+-            device = IMC_DEVICE_CHANNEL[channel];
+-            function = IMC_FUNCTION_CHANNEL[channel];
+-            offset_rd = IMC_PMONCTRL_OFFSET[0];//read
+-            offset_wr = IMC_PMONCTRL_OFFSET[1];//write
+-            offset_dclk = IMC_PMONCTRL_OFFSET[4];//DCLK
+-
+-            pci_bus = NULL;
+-            pci_bus = pci_find_bus(0, bus);
+-            if(pci_bus) {
+-                pci_bus_write_config_dword(pci_bus, PCI_DEVFN(device, function),
+-                                                        offset_rd, 0x00420304);
+-                pci_bus_write_config_dword(pci_bus, PCI_DEVFN(device, function),
+-                                                        offset_wr, 0x00420c04);
+-                pci_bus_write_config_dword(pci_bus, PCI_DEVFN(device, function),
+-                                                        offset_dclk, 0x00400000);
+-            }
++      	msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 2; // counter 2
++        msr_val = 0x113; // RxC Insert
++        ret = wrmsr_on_cpu(RxC_CORE_MON, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 2 failed\n");
++            return -1;
++        }
++
++        msr_num = CHA_MSR_PMON_CTL_BASE + (0x10 * cha) + 3; // counter 3
++        msr_val = 0x213; // RxC Insert reject
++        ret = wrmsr_on_cpu(RxC_CORE_MON, msr_num, msr_val & 0xFFFFFFFF, msr_val >> 32);
++        if(ret != 0) {
++            printk(KERN_ERR "wrmsr COUNTER 3 failed\n");
++            return -1;
+         }
++	}
++
++    // IMC: resolve PMON MMIO regions and program CAS_COUNT.RD/.WR + CLOCKTICKS
++    // on every channel of every iMC on every socket.
++    ret = spr_imc_init();
++    if (ret) {
++        pr_err("[%s] spr_imc_init failed: %d\n", __func__, ret);
++        return ret;
+     }
+ 
++    for (socket = 0; socket < NUM_SOCKETS; socket++) {
++        int imc;
++        for (imc = 0; imc < NUM_IMC_PER_SOCKET; imc++) {
++            int ch;
++            for (ch = 0; ch < NUM_CH_PER_IMC; ch++)
++                spr_imc_program_box(socket, imc, ch);
++        }
++    }
+ 
+     return 0;
+ }
+@@ -2188,11 +2359,7 @@ void measure_latency(u64 (*cur_tor_ctr_val)[2], u64 (*prev_tor_ctr_val)[2],
+ 	u64 cum_rxc_insert, cur_rxc_insert, cur_rxc_reject;
+ 	u64 cur_rej_ratio_local, cur_rej_ratio_remote;
+ 
+-	int socket, channel, bus, device, function;
+-	int offset_rd, offset_wr, offset_dclk;
+-	uint32_t low, high;
+-	uint64_t count;
+-	struct pci_bus *pci_bus;
++	int socket, channel;
+ 
+ 	uint64_t local_read_BW, local_write_BW;
+ 	uint64_t remote_read_BW, remote_write_BW;
+@@ -2238,42 +2405,23 @@ void measure_latency(u64 (*cur_tor_ctr_val)[2], u64 (*prev_tor_ctr_val)[2],
+ 	WRITE_ONCE(smoothed_rxc_reject_ratio_remote, cur_rej_ratio_remote);
+ 
+ 
+-	// Measure BW
+-	for(socket = 0; socket < NUM_SOCKETS; socket++) {
+-		bus = IMC_BUS_SOCKET[socket];
+-		for(channel = 0; channel < NUM_IMC_CHANNELS; channel++) {
+-			device = IMC_DEVICE_CHANNEL[channel];
+-			function = IMC_FUNCTION_CHANNEL[channel];
+-			offset_rd = IMC_PMONCTR_OFFSET[0];
+-			offset_wr = IMC_PMONCTR_OFFSET[1];
+-			offset_dclk = IMC_PMONCTR_OFFSET[4];
+-
+-			pci_bus = NULL;
+-			pci_bus = pci_find_bus(0, bus);
+-			if(pci_bus) {
+-				// read
+-				pci_bus_read_config_dword(pci_bus, PCI_DEVFN(device, function),
+-									offset_rd, &low);
+-				pci_bus_read_config_dword(pci_bus, PCI_DEVFN(device, function),
+-									offset_rd + sizeof(uint32_t), &high);
+-				count = ((uint64_t) high) << 32 | (uint64_t) low;
+-				cur_imc_counts[socket][channel][0] = count;
+-
+-				// write
+-				pci_bus_read_config_dword(pci_bus, PCI_DEVFN(device, function),
+-									offset_wr, &low);
+-				pci_bus_read_config_dword(pci_bus, PCI_DEVFN(device, function),
+-									offset_wr + sizeof(uint32_t), &high);
+-				count = ((uint64_t) high) << 32 | (uint64_t) low;
+-				cur_imc_counts[socket][channel][1] = count;
+-
+-				// DCLK
+-				pci_bus_read_config_dword(pci_bus, PCI_DEVFN(device, function),
+-									offset_dclk, &low);
+-				pci_bus_read_config_dword(pci_bus, PCI_DEVFN(device, function),
+-									offset_dclk + sizeof(uint32_t), &high);
+-				count = ((uint64_t) high) << 32 | (uint64_t) low;
+-				cur_imc_counts[socket][channel][4] = count;
++	// Measure BW: SPR exposes 8 channels/socket (4 iMCs * 2 channels) via MMIO.
++	// Counter assignment matches spr_imc_program_box():
++	//   ctr0 = CAS_COUNT.RD, ctr1 = CAS_COUNT.WR, ctr2 = CLOCKTICKS.
++	for (socket = 0; socket < NUM_SOCKETS; socket++) {
++		int imc, ch;
++		for (imc = 0; imc < NUM_IMC_PER_SOCKET; imc++) {
++			for (ch = 0; ch < NUM_CH_PER_IMC; ch++) {
++				void __iomem *base = spr_imc_mmio[socket][imc][ch];
++				int idx = spr_imc_chan_idx(imc, ch);
++				if (!base)
++					continue;
++				cur_imc_counts[socket][idx][0] =
++					spr_imc_read_ctr(base, SPR_IMC_PMON_CTR(0));
++				cur_imc_counts[socket][idx][1] =
++					spr_imc_read_ctr(base, SPR_IMC_PMON_CTR(1));
++				cur_imc_counts[socket][idx][4] =
++					spr_imc_read_ctr(base, SPR_IMC_PMON_CTR(2));
+ 			}
+ 		}
+ 	}
+@@ -2326,15 +2474,9 @@ void check_pebs_period(void)
+ 	int i;
+ 	struct mem_cgroup *memcg;
+ 	unsigned long stable_period, init_period;
+-	
+-	if(test_bit(TRANSPARENT_HUGEPAGE_FLAG, &transparent_hugepage_flags)) {
+-		stable_period = PEBS_STABLE_PERIOD;
+-		init_period = PEBS_INIT_PERIOD;
+-	}
+-	else {
+-		stable_period = PEBS_STABLE_PERIOD_BASEPAGE;
+-		init_period = PEBS_INIT_PERIOD_BASEPAGE;
+-	}
++
++	stable_period = READ_ONCE(pebs_stable_period);
++	init_period = READ_ONCE(pebs_init_period);
+ 	if(!use_dram_determination) {
+ 		if(READ_ONCE(pebs_sample_period) != stable_period) {
+ 			pebs_update_period(stable_period);
+@@ -2521,10 +2663,12 @@ static void ksampled_stop(void)
+ {
+ 	int cpu, event, i;
+ 	if(ksampled_thread) {
+-		kthread_stop(ksampled_thread);	
++		kthread_stop(ksampled_thread);
+ 		ksampled_thread = NULL;
+ 	}
+-	
++
++	spr_imc_unmap_all();
++
+ 	for (cpu = 0; cpu < CORES_PER_SOCKET; cpu++) {
+ 		for (event = 0; event < NR_EVENTTYPE; event++) {
+ 			if (pfe[cpu][event])
+diff --git a/scripts/run_bench.c b/scripts/run_bench.c
+index 4b1148697..4e0391164 100644
+--- a/scripts/run_bench.c
++++ b/scripts/run_bench.c
+@@ -1,6 +1,5 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+-#include <string.h>
+ #include <unistd.h>
+ #include <err.h>
+ #include <sys/wait.h>
+@@ -28,34 +27,27 @@ double elapsed(struct timeval *starttime, struct timeval *endtime)
+ 
+ long mttm_register_pid(pid_t pid, const char *name)
+ {
+-	return syscall(449, pid, name);
++	return syscall(598, pid, name);
+ }
+ 
+ long mttm_unregister_pid(pid_t pid)
+ {
+-	return syscall(450, pid);
++	return syscall(599, pid);
+ }
+ 
+ int main(int argc, char** argv)
+ {
+ 	pid_t pid;
+-	int state, i;
++	int state;
+ 	struct timeval start, end;
+-	char clean_name[1024];
++	const char *clean_name;
+ 
+-	if (argc < 2) {
+-		printf("Usage: ./run_bench [BENCHMARK]\n");
++	if (argc < 3) {
++		printf("Usage: ./run_bench [CLEAN_NAME] [BENCHMARK]\n");
+ 		return 0;
+ 	}
+ 
+-	for(i = strlen(argv[1]); i >= 0; i--) {
+-		if(argv[1][i] == '/') {
+-			strncpy(clean_name, &argv[1][i+1], strlen(argv[1]) - i + 1);
+-			break;
+-		}
+-		if(i == 0)
+-			strncpy(clean_name, argv[1], strlen(argv[1]) + 1);
+-	}
++	clean_name = argv[1];
+ 
+ 	gettimeofday(&start, NULL);
+ 	mttm_register_pid(getpid(), clean_name);
+@@ -63,7 +55,7 @@ int main(int argc, char** argv)
+ 
+ 	pid = fork();
+ 	if (pid == 0) {
+-		execvp(argv[1], &argv[1]);
++		execvp(argv[2], &argv[2]);
+ 		printf("Fail to run bench\n");
+ 		exit(-1);
+ 	}
+diff --git a/scripts/run_bench_vtmm.c b/scripts/run_bench_vtmm.c
+index 8aeeb5fd1..7f8ed3a75 100644
+--- a/scripts/run_bench_vtmm.c
++++ b/scripts/run_bench_vtmm.c
+@@ -28,12 +28,12 @@ double elapsed(struct timeval *starttime, struct timeval *endtime)
+ 
+ long vtmm_register_pid(pid_t pid, const char *name)
+ {
+-	return syscall(451, pid, name);
++	return syscall(600, pid, name);
+ }
+ 
+ long vtmm_unregister_pid(pid_t pid)
+ {
+-	return syscall(452, pid);
++	return syscall(601, pid);
+ }
+ 
+ int main(int argc, char** argv)

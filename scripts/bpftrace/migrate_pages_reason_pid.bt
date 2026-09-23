@@ -1,0 +1,62 @@
+/*
+ * migrate_pages_reason_pid.bt
+ *
+ * Usage: bpftrace migrate_pages_reason_pid.bt -p <pid>
+ *
+ * Traces migrate_pages and mm_migrate_pages filtered to the target process.
+ * pid is the bpftrace built-in that reflects the current CPU's running process.
+ *
+ * For TPP (NUMA balancing), migrations fire in the workload's process context
+ * (MR_NUMA_MISPLACED), so pid filtering captures them correctly.
+ * kswapd-driven reclaim fires in kswapd context and is intentionally excluded.
+ */
+
+enum migrate_mode {
+    MIGRATE_ASYNC        = 0,
+    MIGRATE_SYNC_LIGHT   = 1,
+    MIGRATE_SYNC         = 2,
+    MIGRATE_SYNC_NO_COPY = 3,
+};
+
+BEGIN
+{
+    printf("Tracing NUMA migration for pid %d ... Hit Ctrl-C to end.\n", $1);
+}
+
+kprobe:migrate_pages
+/pid == $1/
+{
+    /* arg3 = mode, arg5 = reason */
+    @kp_reason[arg3, arg5] = count();
+}
+
+tracepoint:migrate:mm_migrate_pages
+/pid == $1/
+{
+    @tp_reason[args->reason]  = count();
+    @tp_succ[args->reason]    = sum(args->succeeded);
+    @tp_fail[args->reason]    = sum(args->failed);
+}
+
+interval:s:1
+{
+    printf("-- pid=%d --\n", $1);
+    print(@kp_reason);
+    print(@tp_reason);
+    print(@tp_succ);
+    print(@tp_fail);
+
+    clear(@kp_reason);
+    clear(@tp_reason);
+    clear(@tp_succ);
+    clear(@tp_fail);
+}
+
+END
+{
+    printf("Final summary for pid %d:\n", $1);
+    print(@kp_reason);
+    print(@tp_reason);
+    print(@tp_succ);
+    print(@tp_fail);
+}

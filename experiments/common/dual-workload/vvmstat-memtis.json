@@ -1,0 +1,19 @@
+{
+  "vm_state_items": [
+  ],
+  "vm_acc_items": [
+    "htmm_nr_promoted",
+    "htmm_nr_demoted",
+    "htmm_nr_sampled",
+    "htmm_missed_dramread",
+    "htmm_missed_nvmread",
+    "htmm_missed_write",
+    "htmm_alloc_dram",
+    "htmm_alloc_nvm",
+    "htmm_nr_cong_demoted"
+  ],
+  "cg_stat_items":[
+    "anon",
+    "anon_thp"
+  ]
+}

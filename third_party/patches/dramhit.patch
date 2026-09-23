@@ -1,0 +1,437 @@
+diff --git a/include/hashtables/cas_kht.hpp b/include/hashtables/cas_kht.hpp
+index 7d29c71..5fae823 100644
+--- a/include/hashtables/cas_kht.hpp
++++ b/include/hashtables/cas_kht.hpp
+@@ -56,6 +56,12 @@ class CASHashTable : public BaseHashTable {
+   uint32_t insert_queue_sz;
+   uint32_t INSERT_QUEUE_SZ_MASK;
+   uint32_t FIND_QUEUE_SZ_MASK;
++  // Drain thresholds derived from queue size and config.batch_len so that a
++  // batch can always be added after flush_if_needed without overflowing. The
++  // queue must leave at least one slot empty (head==tail means empty), so
++  // we reserve batch_len + 1 slots above the threshold.
++  uint32_t insert_flush_threshold;
++  uint32_t find_flush_threshold;
+   uint64_t HT_BUCKET_MASK;
+ 
+   const static __mmask8 KEYMSK = 0b01010101;
+@@ -111,6 +117,17 @@ class CASHashTable : public BaseHashTable {
+     this->FIND_QUEUE_SZ_MASK = this->find_queue_sz - 1;
+     this->INSERT_QUEUE_SZ_MASK = this->insert_queue_sz - 1;
+ 
++    const uint32_t reserve = config.batch_len + 1;
++    if (this->insert_queue_sz < reserve || this->find_queue_sz < reserve) {
++      PLOGE.printf(
++          "queue_sz (%u) must be > config.batch_len (%u); "
++          "raise --find_queue_sz or lower --batch_len",
++          this->find_queue_sz, config.batch_len);
++      abort();
++    }
++    this->insert_flush_threshold = this->insert_queue_sz - reserve;
++    this->find_flush_threshold = this->find_queue_sz - reserve;
++
+     this->HT_BUCKET_MASK =
+         (uint32_t)((this->capacity - 1) & ~(KEYS_IN_CACHELINE_MASK));
+   }
+@@ -186,7 +203,7 @@ class CASHashTable : public BaseHashTable {
+     uint32_t next_tail;
+     const void *next_tail_addr;
+ #endif
+-    while (curr_queue_sz > INS_FLUSH_THRESHOLD) {
++    while (curr_queue_sz > insert_flush_threshold) {
+ #ifdef DOUBLE_PREFETCH
+       next_tail = (this->ins_tail + PREFETCH_INSERT_NEXT_DISTANCE) &
+                   INSERT_QUEUE_SZ_MASK;
+@@ -460,8 +477,8 @@ class CASHashTable : public BaseHashTable {
+     const void *next_tail_addr;
+ #endif
+     size_t curr_queue_sz = get_find_queue_sz();
+-    while ((curr_queue_sz > FLUSH_THRESHOLD) &&
+-           (vp.first < config.batch_len)) {  // 32 64 16
++    while ((curr_queue_sz > find_flush_threshold) &&
++           (vp.first < config.batch_len)) {
+ #ifdef DOUBLE_PREFETCH
+       next_tail =
+           (this->find_tail + PREFETCH_FIND_NEXT_DISTANCE) & FIND_QUEUE_SZ_MASK;
+diff --git a/include/hashtables/ht_helper.hpp b/include/hashtables/ht_helper.hpp
+index 279c580..1daf9da 100644
+--- a/include/hashtables/ht_helper.hpp
++++ b/include/hashtables/ht_helper.hpp
+@@ -44,6 +44,13 @@ constexpr uint64_t cache_block_aligned_addr(uint64_t addr) {
+ 
+ inline void distribute_mem_to_nodes(void *addr, uint64_t alloc_sz,
+                                     numa_policy_threads policy) {
++  // numa-split=0: skip internal binding; external numactl manages placement.
++  if (static_cast<uint32_t>(policy) == 0) {
++    PLOG_INFO.printf(
++        "numa-split=0: skipping memory binding (external numactl manages "
++        "placement)");
++    return;
++  }
+   // Check if there is only one NUMA node
+   if (numa_num_configured_nodes() == 1) {
+     PLOG_INFO.printf(
+@@ -189,30 +196,34 @@ T *calloc_ht(uint64_t capacity, uint16_t id, int *out_fd) {
+     exit(-1);
+   }
+ 
+-  int flags;
+   alloc_sz = round_hugepage(alloc_sz);
+ 
++  // Use THP (madvise mode) instead of reserved hugetlbfs pages so the run
++  // does not depend on nr_hugepages having been pre-reserved. The kernel
++  // backs the mapping with 2 MiB THP where possible; the allocation size is
++  // still rounded up to 1 GiB above 1 GiB so layout math is unchanged.
++  // MAP_POPULATE forces eager fault-in so promotion happens before the
++  // measurement, not lazily via khugepaged during the hot loop.
++  const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+   if (alloc_sz < ONEGB_PAGE_SZ) {
+-    flags = MAP_FLAGS_2MB;
+-    PLOGI.printf("allocating %lu 2mb pages bytes %lu", alloc_sz / TWOMB_PAGE_SZ,
+-                 alloc_sz);
++    PLOGI.printf("allocating %lu 2mb-equivalent bytes (THP)", alloc_sz);
+   } else {
+-    flags = MAP_FLAGS_1GB;
+-    PLOGI.printf("allocating %lu 1gb pages bytes %lu", alloc_sz / ONEGB_PAGE_SZ,
+-                 alloc_sz);
++    PLOGI.printf("allocating %lu 1gb-equivalent bytes (THP)", alloc_sz);
+   }
+ 
+   addr = (T *)mmap(ADDR, alloc_sz, PROT_RW, flags, -1, 0);
+ 
+-  //close(fd);
+-  //unlink(FILE_NAME);
+   if (addr == MAP_FAILED) {
+-    //unlink(FILE_NAME);
+-    PLOGE.printf("mmap failed");
++    PLOGE.printf("mmap failed (size=%lu, errno=%d)", alloc_sz, errno);
+     exit(1);
+   } else {
+     PLOGI.printf("mmap returns %p", addr);
+   }
++
++  if (madvise(addr, alloc_sz, MADV_HUGEPAGE) != 0) {
++    PLOGW.printf("MADV_HUGEPAGE failed (size=%lu, errno=%d); base pages will be used",
++                 alloc_sz, errno);
++  }
+   *out_fd = fd;
+ 
+   //if (alloc_sz >= ONEGB_PAGE_SZ) {
+diff --git a/include/utils/hugepage_allocator.hpp b/include/utils/hugepage_allocator.hpp
+index b92579e..643f5c4 100644
+--- a/include/utils/hugepage_allocator.hpp
++++ b/include/utils/hugepage_allocator.hpp
+@@ -3,7 +3,8 @@
+ // adapted from https://rigtorp.se/hugepages/
+ 
+ #include <fcntl.h>
+-#include <sys/mman.h>  // mmap, munmap
++#include <sys/mman.h>  // mmap, munmap, madvise, MADV_HUGEPAGE
++#include <cerrno>
+ #include <cstdint>
+ 
+ #include "plog/Log.h"
+@@ -59,8 +60,13 @@ struct huge_page_allocator {
+     std::tie(is_1gb, alloc_sz) = get_rounded_alloc_size(raw_alloc_sz);
+ 
+ 
+-    auto MAP_FLAGS = MAP_PRIVATE | MAP_HUGETLB | MAP_ANONYMOUS |
+-                     (is_1gb ? MAP_HUGE_1GB : MAP_HUGE_2MB);
++    // Use THP (madvise mode) instead of explicit hugetlbfs reservations.
++    // The kernel only supports 2 MiB THP on most x86_64 builds, so 1 GiB
++    // requests silently get backed by 2 MiB pages — the allocation size is
++    // still rounded up to 1 GiB so layout/alignment math is unchanged.
++    // MAP_POPULATE forces eager fault-in so promotion happens before the
++    // measurement, not lazily via khugepaged during the hot loop.
++    auto MAP_FLAGS = MAP_PRIVATE | MAP_ANONYMOUS;
+ 
+     auto p = static_cast<T *>(
+         mmap(nullptr, alloc_sz, PROT_READ | PROT_WRITE, MAP_FLAGS, -1, 0));
+@@ -70,6 +76,10 @@ struct huge_page_allocator {
+         std::abort();
+     }
+ 
++    if (madvise(p, alloc_sz, MADV_HUGEPAGE) != 0) {
++        PLOGW.printf("MADV_HUGEPAGE failed for %lu bytes (errno=%d); base pages will be used", alloc_sz, errno);
++    }
++
+     return p;
+   }
+ 
+diff --git a/src/Application.cpp b/src/Application.cpp
+index e1c2bf6..17ac4b2 100644
+--- a/src/Application.cpp
++++ b/src/Application.cpp
+@@ -226,6 +226,7 @@ void sync_complete(void) {
+ 
+     sh->stats = (thread_stats *)std::aligned_alloc(CACHE_LINE_SIZE,
+                                                    sizeof(thread_stats));
++    std::memset(sh->stats, 0, sizeof(thread_stats));
+ 
+     switch (config.mode) {
+       case FASTQ_WITH_INSERT:
+@@ -343,21 +344,32 @@ void sync_complete(void) {
+ 
+     // get the shard cpu, numa node first.
+     // we will pin cpu later
+-    int sh_idx = 0;
+-    for (uint32_t assigned_cpu : this->np->get_assigned_cpu_list()) {
+-      Shard *sh = &this->shards[sh_idx];
+-      sh->assigned_cpu = assigned_cpu;
+-      sh->shard_idx = sh_idx;
+-      sh->numa_node = this->np->get_numa_node(assigned_cpu);
+-      if (sh->numa_node < 0) {
+-        PLOGE.printf("unknown node for shard %u cpu %u", sh->shard_idx,
+-                     sh->assigned_cpu);
+-        abort();
+-      } else {
+-        PLOGI.printf("shard %u assigned to %u at numa node %u", sh->shard_idx,
+-                     sh->assigned_cpu, sh->numa_node);
++    if (this->np == nullptr) {
++      // numa-split=0: no internal pinning; external numactl manages placement.
++      // Initialize shards without a fixed CPU/node assignment.
++      for (uint32_t i = 0; i < config.num_threads; i++) {
++        Shard *sh = &this->shards[i];
++        sh->shard_idx = i;
++        sh->assigned_cpu = 0;
++        sh->numa_node = 0;
++      }
++    } else {
++      int sh_idx = 0;
++      for (uint32_t assigned_cpu : this->np->get_assigned_cpu_list()) {
++        Shard *sh = &this->shards[sh_idx];
++        sh->assigned_cpu = assigned_cpu;
++        sh->shard_idx = sh_idx;
++        sh->numa_node = this->np->get_numa_node(assigned_cpu);
++        if (sh->numa_node < 0) {
++          PLOGE.printf("unknown node for shard %u cpu %u", sh->shard_idx,
++                       sh->assigned_cpu);
++          abort();
++        } else {
++          PLOGI.printf("shard %u assigned to %u at numa node %u", sh->shard_idx,
++                       sh->assigned_cpu, sh->numa_node);
++        }
++        sh_idx++;
+       }
+-      sh_idx++;
+     }
+ 
+     if (config.mode == FASTQ_WITH_INSERT) {
+@@ -402,20 +414,24 @@ void sync_complete(void) {
+ 
+     for (uint32_t i = 1; i < config.num_threads; i++) {
+       Shard &sh = this->shards[i];
+-      CPU_ZERO(&cpuset);
+-      CPU_SET(sh.assigned_cpu, &cpuset);
+       auto _thread =
+           std::thread(&Application::shard_thread, this, sh.shard_idx, &barrier);
+-      pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t),
+-                             &cpuset);
++      if (this->np != nullptr) {
++        CPU_ZERO(&cpuset);
++        CPU_SET(sh.assigned_cpu, &cpuset);
++        pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t),
++                               &cpuset);
++      }
+       this->threads.push_back(std::move(_thread));
+     }
+ 
+     // logical index 0, is master thread, which will wait for all other threads
+     Shard *sh = &this->shards[0];
+-    CPU_ZERO(&cpuset);
+-    CPU_SET(sh->assigned_cpu, &cpuset);
+-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
++    if (this->np != nullptr) {
++      CPU_ZERO(&cpuset);
++      CPU_SET(sh->assigned_cpu, &cpuset);
++      sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
++    }
+     this->shard_thread(0, &barrier);
+ 
+     for (auto &th : this->threads) {
+@@ -504,7 +520,8 @@ void sync_complete(void) {
+           "numa-split",
+           po::value<uint32_t>(&config.numa_split)
+               ->default_value(def.numa_split),
+-          "Split spawning threads between numa nodes")(
++          "Split spawning threads between numa nodes (0 = no internal CPU "
++          "pinning or memory binding; let external numactl handle it)")(
+           "stats",
+           po::value<std::string>(&config.stats_file)
+               ->default_value(def.stats_file),
+@@ -784,6 +801,11 @@ void sync_complete(void) {
+         ((config.mode == FASTQ_WITH_INSERT) &&
+          (config.ht_type == PARTITIONED_HT))) {
+       switch (config.numa_split) {
++        case 0:
++          PLOGE.printf(
++              "numa-split=0 is not supported for queue-based modes; use "
++              "external numactl with a queue policy instead. Exiting.");
++          exit(-1);
+         case PROD_CONS_SEPARATE_NODES:
+           this->npq = new NumaPolicyQueues(config.n_prod, config.n_cons,
+                                            PROD_CONS_SEPARATE_NODES);
+@@ -797,10 +819,17 @@ void sync_complete(void) {
+                                            PROD_CONS_EQUAL_PARTITION);
+           break;
+         default:
+-          break;
++          PLOGE.printf("Unknown queue numa policy. Exiting");
++          exit(-1);
+       }
+     } else {
+       switch (config.numa_split) {
++        case 0:
++          PLOGI.printf(
++              "numa-split=0: skipping internal CPU pinning and memory "
++              "binding; expecting external numactl to manage placement");
++          this->np = nullptr;
++          break;
+         case THREADS_SPLIT_SEPARATE_NODES:
+         case THREADS_ASSIGN_SEQUENTIAL:
+         case THREADS_REMOTE_NUMA_NODE:
+diff --git a/src/tests/queue_tests.cpp b/src/tests/queue_tests.cpp
+index ddf6d40..781e8a4 100644
+--- a/src/tests/queue_tests.cpp
++++ b/src/tests/queue_tests.cpp
+@@ -949,9 +949,9 @@ void QueueTest<T>::run_find_test(Configuration *cfg, Numa *n, bool is_join,
+     sh->shard_idx = i;
+     auto _thread = std::thread(&QueueTest::find_thread, this, i, cfg->n_prod,
+                                cfg->n_cons, is_join, &barrier);
+-    CPU_ZERO(&cpuset);
+-    CPU_SET(assigned_cpu, &cpuset);
+-    pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
++      CPU_ZERO(&cpuset);
++      CPU_SET(assigned_cpu, &cpuset);
++      pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+     this->prod_threads.push_back(std::move(_thread));
+     PLOGV.printf("Thread find_thread: %u, affinity: %u", i, assigned_cpu);
+     i += 1;
+@@ -962,9 +962,9 @@ void QueueTest<T>::run_find_test(Configuration *cfg, Numa *n, bool is_join,
+   main_sh->shard_idx = i;
+   CPU_ZERO(&cpuset);
+   uint32_t last_cpu = 0;
+-  CPU_SET(last_cpu, &cpuset);
+-  sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+-  PLOGV.printf("Thread 'controller': affinity: %u", last_cpu);
++    CPU_SET(last_cpu, &cpuset);
++    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
++    PLOGV.printf("Thread 'controller': affinity: %u", last_cpu);
+ 
+   // Spawn find threads
+   i = cfg->n_prod;
+@@ -977,10 +977,10 @@ void QueueTest<T>::run_find_test(Configuration *cfg, Numa *n, bool is_join,
+     auto _thread = std::thread(&QueueTest::find_thread, this, i, cfg->n_prod,
+                                cfg->n_cons, is_join, &barrier);
+ 
+-    CPU_ZERO(&cpuset);
+-    CPU_SET(assigned_cpu, &cpuset);
++      CPU_ZERO(&cpuset);
++      CPU_SET(assigned_cpu, &cpuset);
+ 
+-    pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
++      pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+ 
+     PLOGV.printf("Thread find_thread: %u, affinity: %u", i, assigned_cpu);
+     PLOGV.printf("[%d] sh->insertion_cycles %lu", sh->shard_idx,
+@@ -1060,9 +1060,9 @@ void QueueTest<T>::insert_with_queues(Configuration *cfg, Numa *n, bool is_join,
+     auto _thread =
+         std::thread(&QueueTest<T>::producer_thread, this, i, cfg->n_prod,
+                     cfg->n_cons, false, cfg->skew, is_join, &barrier);
+-    CPU_ZERO(&cpuset);
+-    CPU_SET(assigned_cpu, &cpuset);
+-    pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
++      CPU_ZERO(&cpuset);
++      CPU_SET(assigned_cpu, &cpuset);
++      pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+     this->prod_threads.push_back(std::move(_thread));
+     PLOGV.printf("Thread producer_thread: %u, affinity: %u", i, assigned_cpu);
+     i += 1;
+@@ -1073,9 +1073,9 @@ void QueueTest<T>::insert_with_queues(Configuration *cfg, Numa *n, bool is_join,
+   main_sh->shard_idx = i;
+   CPU_ZERO(&cpuset);
+   uint32_t last_cpu = 0;
+-  CPU_SET(last_cpu, &cpuset);
+-  sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+-  PLOG_DEBUG.printf("Thread 'controller': affinity: %u", last_cpu);
++    CPU_SET(last_cpu, &cpuset);
++    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
++    PLOG_DEBUG.printf("Thread 'controller': affinity: %u", last_cpu);
+ 
+   // Spawn consumer threads
+   i = cfg->n_prod;
+@@ -1089,10 +1089,10 @@ void QueueTest<T>::insert_with_queues(Configuration *cfg, Numa *n, bool is_join,
+         std::thread(&QueueTest<T>::consumer_thread, this, i, cfg->n_prod,
+                     cfg->n_cons, cfg->num_nops, &barrier);
+ 
+-    CPU_ZERO(&cpuset);
+-    CPU_SET(assigned_cpu, &cpuset);
++      CPU_ZERO(&cpuset);
++      CPU_SET(assigned_cpu, &cpuset);
+ 
+-    pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
++      pthread_setaffinity_np(_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+ 
+     PLOGV.printf("Thread consumer_thread: %u, affinity: %u", i, assigned_cpu);
+ 
+diff --git a/src/tests/uniform_test.cpp b/src/tests/uniform_test.cpp
+index 49bacce..0b49ae7 100644
+--- a/src/tests/uniform_test.cpp
++++ b/src/tests/uniform_test.cpp
+@@ -165,27 +165,32 @@ OpTimings do_uniform_inserts(
+ 
+ OpTimings do_uniform_gets(BaseHashTable *hashtable, unsigned int id,
+                           uint64_t requests_num,
+-                          auto sync_barrier) {
++                          auto sync_barrier,
++                          uint64_t &found_out) {
+   uint64_t found = 0;
++  uint64_t all_req = requests_num * config.read_factor;	
+ 
+-  for (auto j = 0u; j < config.read_factor; j++) {
++//  for (auto j = 0u; j < config.read_factor; j++) {
+     if (id == 0) {
+       cur_phase = ExecPhase::finds;
+       zipfian_finds = false;
+     }
+     sync_barrier->arrive_and_wait();
+-    found = do_uniform_batch_find(hashtable, requests_num, id);
++    found += do_uniform_batch_find(hashtable, all_req, id);
+     if (id == 0) {
+       zipfian_finds = true;
+-      zipfian_iter = j;
++      zipfian_iter = 0u;
+     }
+     sync_barrier->arrive_and_wait();
+-  }
++   //}
++
++  found_out = found;
+ 
+   uint64_t duration = 0;
+   uint64_t ops = 0;
+ 
+-  for (int i = 0; i < config.read_factor; i++) duration += g_find_durations[i];
++  //for (int i = 0; i < config.read_factor; i++) duration += g_find_durations[i];
++  duration += g_find_durations[0];
+   ops = requests_num * config.read_factor;
+ 
+   return {duration, ops};
+@@ -213,7 +218,8 @@ void UniformTest::run(Shard *shard, BaseHashTable *hashtable,
+     PLOGI.printf("test insert end");
+     PLOGI.printf("test find start");
+   }
+-  find_timings = do_uniform_gets(hashtable, shard->shard_idx, requests_num, sync_barrier);
++  uint64_t found = 0;
++  find_timings = do_uniform_gets(hashtable, shard->shard_idx, requests_num, sync_barrier, found);
+ 
+   if (shard->shard_idx == 0) {
+     PLOGI.printf("test find end");
+@@ -221,6 +227,7 @@ void UniformTest::run(Shard *shard, BaseHashTable *hashtable,
+ 
+   shard->stats->insertions = insert_timings;
+   shard->stats->finds = find_timings;
++  shard->stats->found = found;
+   shard->stats->ht_fill = config.ht_fill;
+ 
+   if (shard->shard_idx == 0) {
