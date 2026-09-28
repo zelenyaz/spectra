@@ -22,7 +22,7 @@ Build Spectra and run the hardware smoke test on a supported dual-socket Intel S
 cp configs/site.example.conf configs/site.conf
 # Edit configs/site.conf for the machine.
 ./scripts/prepare.sh --build
-sudo --preserve-env=SPECTRA_CONFIG ./scripts/run.sh smoke
+sudo ./scripts/run.sh smoke
 ```
 
 The test uses two 256 MiB objects for about 16 seconds. It requires root because Spectra opens system-wide PEBS and uncore PMU events. A successful run produces at least one `=== Epoch` record in `results/generated/smoke/stderr.log`.
