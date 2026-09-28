@@ -48,7 +48,7 @@ The microbenchmark pairs are `sdrd-chksdrd`, `sdprd-rr`, `sdrdpf-rr`, `sdrd-sdrw
 On a supported dual-socket Sapphire Rapids machine, copy `configs/site.example.conf` to `configs/site.conf` and set the machine and workload paths. Supply the licensed SPEC CPU 2017 installation and FAISS index and query files described in [`third_party/README.md`](third_party/README.md). Then run:
 
 ```sh
-./scripts/prepare.sh
+sudo ./scripts/prepare.sh
 ```
 
 This builds the binaries, offers to prepare missing kernels and workloads, and checks experiment prerequisites. Full experiments require root and change system settings; use a dedicated test machine.
