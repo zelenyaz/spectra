@@ -17,7 +17,32 @@ Usage:
   ./scripts/run.sh list
 
 Set SPECTRA_RUN_ID (default: run1) to keep repetitions separate.
+Results are writable by the sudo caller (or the repository owner when run as root).
+Set SPECTRA_RESULTS_UID and SPECTRA_RESULTS_GID to override the result owner.
 EOF
+}
+
+finish_results() {
+    local rc=$?
+    trap - EXIT
+    if ! python3 "${SCRIPT_DIR}/lib/result_permissions.py" repair "${SPECTRA_ROOT}" \
+        "${SPECTRA_RESULTS_UID}" "${SPECTRA_RESULTS_GID}" "${RESULT_PERMISSION_PATHS[@]}"; then
+        printf '[spectra][ERROR] Could not restore result permissions\n' >&2
+        (( rc != 0 )) || rc=1
+    fi
+    exit "${rc}"
+}
+
+run_with_results() {
+    local owner
+    owner="$(python3 "${SCRIPT_DIR}/lib/result_permissions.py" owner "${SPECTRA_ROOT}")"
+    export SPECTRA_RESULTS_UID="${owner%%:*}"
+    export SPECTRA_RESULTS_GID="${owner##*:}"
+    # Keep this shell alive so failures also hand partial results to the caller.
+    trap finish_results EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    "$@"
 }
 
 export_site() {
@@ -52,7 +77,8 @@ cmd="${1:-}"
 case "${cmd}" in
     smoke)
         export_site
-        exec "${SCRIPT_DIR}/smoke.sh"
+        RESULT_PERMISSION_PATHS=("${SPECTRA_ROOT}/results/generated/smoke")
+        run_with_results "${SCRIPT_DIR}/smoke.sh"
         ;;
     microbench)
         [[ $# -eq 3 ]] || { usage >&2; exit 2; }
@@ -63,7 +89,8 @@ case "${cmd}" in
         resolve_baseline
         export RESULTS_ROOT="${SPECTRA_ROOT}/results/generated/raw/microbench/${results_subdir}/${run_id}"
         export TMP_CONFIG_DIR="${SPECTRA_ROOT}/results/generated/configs/${run_id}/microbench"
-        exec "${SPECTRA_ROOT}/experiments/microbench/run-suite.sh" "${baseline}" "$3"
+        RESULT_PERMISSION_PATHS=("${RESULTS_ROOT}/$3/${baseline}" "${TMP_CONFIG_DIR}")
+        run_with_results "${SPECTRA_ROOT}/experiments/microbench/run-suite.sh" "${baseline}" "$3"
         ;;
     congestion)
         [[ $# -eq 2 ]] || { usage >&2; exit 2; }
@@ -83,7 +110,8 @@ case "${cmd}" in
         export TIERMEM_CC_INTERLEAVE_G=128
         export TIERMEM_CC_LAT_EWMA=0.7
         export TIERMEM_NO_THREAD_PAUSE=1
-        exec "${SPECTRA_ROOT}/experiments/microbench/run-suite.sh" "$2" sdprw-rrw
+        RESULT_PERMISSION_PATHS=("${RESULTS_ROOT}/sdprw-rrw/$2" "${TMP_CONFIG_DIR}")
+        run_with_results "${SPECTRA_ROOT}/experiments/microbench/run-suite.sh" "$2" sdprw-rrw
         ;;
     macrobench)
         [[ $# -eq 3 ]] || { usage >&2; exit 2; }
@@ -94,7 +122,8 @@ case "${cmd}" in
         resolve_baseline
         export RESULTS_ROOT="${SPECTRA_ROOT}/results/generated/raw/macrobench/${results_subdir}/${run_id}"
         export TMP_CONFIG_DIR="${SPECTRA_ROOT}/results/generated/configs/${run_id}/macrobench"
-        exec "${SPECTRA_ROOT}/experiments/macrobench/run-suite.sh" "${baseline}" "$3"
+        RESULT_PERMISSION_PATHS=("${RESULTS_ROOT}/$3/${baseline}" "${TMP_CONFIG_DIR}")
+        run_with_results "${SPECTRA_ROOT}/experiments/macrobench/run-suite.sh" "${baseline}" "$3"
         ;;
     dry-run)
         [[ $# -eq 4 ]] || { usage >&2; exit 2; }
@@ -103,13 +132,14 @@ case "${cmd}" in
         resolve_baseline
         export RESULTS_ROOT="${SPECTRA_ROOT}/results/generated/dry-run/$2/${results_subdir}"
         export TMP_CONFIG_DIR="${SPECTRA_ROOT}/results/generated/dry-run/configs/$2/${results_subdir}"
+        RESULT_PERMISSION_PATHS=("${RESULTS_ROOT}/$4/${baseline}" "${TMP_CONFIG_DIR}")
         case "$2" in
             microbench)
-                exec "${SPECTRA_ROOT}/experiments/microbench/run-suite.sh" --dry-run "${baseline}" "$4"
+                run_with_results "${SPECTRA_ROOT}/experiments/microbench/run-suite.sh" --dry-run "${baseline}" "$4"
                 ;;
             macrobench)
                 export SPECTRA_DRY_RUN=1
-                exec "${SPECTRA_ROOT}/experiments/macrobench/run-suite.sh" "${baseline}" "$4"
+                run_with_results "${SPECTRA_ROOT}/experiments/macrobench/run-suite.sh" "${baseline}" "$4"
                 ;;
             *) spectra_die "dry-run suite must be microbench or macrobench" ;;
         esac

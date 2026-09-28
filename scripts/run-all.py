@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 
+from lib.result_permissions import repair_results, results_owner
+
 
 ROOT = Path(__file__).resolve().parent.parent
 KERNEL_SWITCHER = ROOT / "experiments/common/kernel_version_switcher.sh"
@@ -55,6 +57,17 @@ def load_state():
     return json.loads(STATE_FILE.read_text())
 
 
+def result_env(state=None):
+    env = os.environ.copy()
+    if state is not None and "results_uid" in state and "results_gid" in state:
+        uid, gid = state["results_uid"], state["results_gid"]
+    else:
+        uid, gid = results_owner(ROOT)
+    env["SPECTRA_RESULTS_UID"] = str(uid)
+    env["SPECTRA_RESULTS_GID"] = str(gid)
+    return env
+
+
 def make_plan(runs, run_start):
     cells = []
     for group, kernel in enumerate(KERNELS):
@@ -92,7 +105,7 @@ def nonempty(path):
     return path.exists() and (not path.is_dir() or any(path.iterdir()))
 
 
-def preflight(cells, config):
+def preflight(cells, config, env=None):
     if not config.is_file():
         raise RuntimeError(f"Site config is missing: {config}")
     if not KERNEL_SWITCHER.is_file() or not os.access(KERNEL_SWITCHER, os.X_OK):
@@ -103,7 +116,7 @@ def preflight(cells, config):
     collisions = [str(result_dir(cell)) for cell in cells if nonempty(result_dir(cell))]
     if collisions:
         raise RuntimeError(f"Existing result directory: {collisions[0]}; use --run-start to select fresh runs")
-    env = os.environ.copy()
+    env = result_env() if env is None else env.copy()
     env["SPECTRA_CONFIG"] = str(config)
     with (STATE_DIR / "preflight.log").open("w") as log:
         for pair in MICRO:
@@ -149,9 +162,12 @@ def start(args):
         raise RuntimeError("Campaign state already exists; use status/resume or reset after review")
     cells = make_plan(args.runs, args.run_start)
     config = Path(args.config).expanduser().resolve()
+    uid, gid = results_owner(ROOT)
+    owner_state = {"results_uid": uid, "results_gid": gid}
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    preflight(cells, config)
+    preflight(cells, config, result_env(owner_state))
     state = {"active": True, "status": "running", "index": 0, "attempt": 0,
+             **owner_state,
              "pending_kernel": None, "runs": args.runs, "run_start": args.run_start,
              "validated_kernels": [],
              "sleep": args.sleep, "boot_delay": args.boot_delay,
@@ -163,15 +179,21 @@ def start(args):
     print(f"Started {len(cells)} cells across {len(KERNELS)} kernels")
 
 
-def archive_partial(cell, attempt):
+def archive_partial(cell, attempt, owner=None):
     source = result_dir(cell)
+    configs = ROOT / "results/generated/configs" / cell["run_id"] / cell["suite"]
+    owner = owner if owner is not None else results_owner(ROOT)
     if not nonempty(source):
+        repair_results(ROOT, [source, configs], owner)
         return
     target = ROOT / "results/generated/failed/all-in-one" / cell_key(cell) / f"attempt{attempt}"
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise RuntimeError(f"Failure archive already exists: {target}")
     source.rename(target)
+    # A power loss may have skipped run.sh's cleanup. Also repair the original
+    # parent directories and configs, even when this was the final attempt.
+    repair_results(ROOT, [target, source, configs], owner)
     print(f"Archived partial result: {target}", flush=True)
 
 
@@ -225,6 +247,12 @@ def drive(_args):
         if not state["active"]:
             print(f"Campaign is {state['status']}; nothing to run")
             return
+        # Older campaigns did not record the caller; use the repository owner
+        # when the boot service has no sudo environment, then persist it.
+        if "results_uid" not in state or "results_gid" not in state:
+            state["results_uid"], state["results_gid"] = results_owner(ROOT)
+            atomic_json(STATE_FILE, state)
+        owner = (state["results_uid"], state["results_gid"])
         cells = state["cells"]
         while state["index"] < len(cells):
             cell = cells[state["index"]]
@@ -248,7 +276,7 @@ def drive(_args):
                 state["pending_kernel"] = None
                 atomic_json(STATE_FILE, state)
             if cell["kernel"] not in state["validated_kernels"]:
-                env = os.environ.copy()
+                env = result_env(state)
                 env["SPECTRA_CONFIG"] = state["config"]
                 check_log = STATE_DIR / f"preflight-{cell['kernel']}.log"
                 with check_log.open("w") as log:
@@ -261,7 +289,7 @@ def drive(_args):
                 atomic_json(STATE_FILE, state)
             # A service interrupted mid-cell has an uncommitted attempt.
             if state["attempt"]:
-                archive_partial(cell, state["attempt"])
+                archive_partial(cell, state["attempt"], owner)
                 if state["attempt"] >= state["max_attempts"]:
                     fail(state, f"{key} exhausted {state['max_attempts']} attempts")
             state["attempt"] += 1
@@ -269,7 +297,7 @@ def drive(_args):
             attempt = state["attempt"]
             log_path = STATE_DIR / "logs" / f"{key}-attempt{attempt}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            env = os.environ.copy()
+            env = result_env(state)
             env["SPECTRA_CONFIG"] = state["config"]
             env["SPECTRA_RUN_ID"] = cell["run_id"]
             command = [str(ROOT / "scripts/run.sh"), cell["suite"], cell["baseline"]]
@@ -283,7 +311,7 @@ def drive(_args):
                 print(f"Failed (runner rc={result.returncode}, output valid={result_is_valid(cell)}); "
                       f"see {log_path}", flush=True)
                 if attempt >= state["max_attempts"]:
-                    archive_partial(cell, attempt)
+                    archive_partial(cell, attempt, owner)
                     fail(state, f"{key} failed after {attempt} attempts; see {log_path}")
                 continue
             state["index"] += 1
