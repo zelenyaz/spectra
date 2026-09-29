@@ -28,7 +28,7 @@ BASELINES = (
     ("memtis",),
     ("mttm",),
 )
-CONGESTION = (("colloid", "libtiermem"), ("mtcolloid",), ())
+CONGESTION = (("colloid",), ("mtcolloid", "libtiermem"), ())
 
 
 def require_root():
