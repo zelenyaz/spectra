@@ -374,10 +374,11 @@ core_range() {
 # ── Config writer ───────────────────────────────────────────────────
 write_dual_config() {
     # $1=out-file $2=baseline $3=outdir $4=app1 $5=t1 $6=app2 $7=t2
-    # $8=dram_free $9=ltm_budget $10=memtis_mib $11=mttm_mib
+    # $8=dram_free $9=ltm_budget $10=memtis_mib $11=mttm_mib $12=combo-id
     local out="$1" baseline="$2" outdir="$3"
     local a1="$4" t1="$5" a2="$6" t2="$7"
     local dram_default="$8" ltm_default="$9" memtis_default="${10}" mttm_default="${11}"
+    local combo_id="${12}"
 
     # Allow env overrides (uniform across all combos when set).
     local dram_free="${DRAM_FREE_MIB-${dram_default}}"
@@ -464,6 +465,12 @@ EOF
         static|mttm|libtiermem) enable_vvmstat=0 ;;
     esac
 
+    # plots/macro-converge.py reads migration logs only for these TPP pairs.
+    local enable_bpftrace=0
+    case "${baseline}:${combo_id}" in
+        tpp:llama-faissflat|tpp:spec619-llama) enable_bpftrace=1 ;;
+    esac
+
     mkdir -p "$(dirname "${out}")"
     cat > "${out}" <<EOF
 #!/usr/bin/env bash
@@ -505,6 +512,7 @@ VVMSTAT_INTERVAL=1
 NUMA_MAPS_INTERVAL=2
 ENABLE_VVMSTAT=${enable_vvmstat}
 ENABLE_NUMA_MAPS=1
+ENABLE_BPFTRACE=${enable_bpftrace}
 
 TARGET_PID_TIMEOUT_SEC=60
 EOF
@@ -548,7 +556,7 @@ run_one() {
 
     write_dual_config "${config}" "${baseline}" "${outdir}" \
         "${app1}" "${t1}" "${app2}" "${t2}" \
-        "${dram}" "${ltm}" "${mts}" "${mttm}"
+        "${dram}" "${ltm}" "${mts}" "${mttm}" "${combo_id}"
 
     if (( SPECTRA_DRY_RUN )); then
         cat "${config}"

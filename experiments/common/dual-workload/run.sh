@@ -501,7 +501,8 @@ VVMSTAT_CONFIG="${SCRIPT_DIR}/vvmstat-tiering.json"
 ENABLE_VVMSTAT=1
 ENABLE_NUMA_MAPS=1
 ENABLE_PIDSTAT=1
-ENABLE_BPFTRACE=1
+# The macrobench suite enables migration tracing only for plots that use it.
+ENABLE_BPFTRACE=0
 BPFTRACE_BIN="${BPFTRACE_BIN:-/usr/bin/bpftrace}"
 BPFTRACE_SCRIPT="${SCRIPT_DIR}/../../../scripts/bpftrace/migrate_pages_reason_pid.bt"
 ALTO_SCAN_SCALE="${ALTO_SCAN_SCALE:-}"
