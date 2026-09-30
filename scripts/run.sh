@@ -100,6 +100,7 @@ case "${cmd}" in
         run_id="${SPECTRA_RUN_ID:-run1}"
         export RESULTS_ROOT="${SPECTRA_ROOT}/results/generated/raw/congestion/${run_id}"
         export TMP_CONFIG_DIR="${SPECTRA_ROOT}/results/generated/configs/${run_id}/congestion"
+        export DRAM_FREE_MIB=5600
         export TIERMEM_CONGEST_CTRL=1
         export TIERMEM_EPOCH_SEC=1
         export TIERMEM_CC_DELTA_IN=0.05
